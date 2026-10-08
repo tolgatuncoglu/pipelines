@@ -433,6 +433,47 @@ To return to defaults, remove the overrides and roll out the deployment. Before
 lowering `MAX_PIPELINE_SPEC_BYTES`, check stored pipelines accepted under the higher
 limit: object-store specifications may no longer be readable for subsequent execution. This
 setting does not add a new size check to the existing direct database-spec read path.
+
+### Kubernetes pipeline store object size limit
+
+When the API server uses the Kubernetes pipeline store, each pipeline version is persisted as a
+single `PipelineVersion` object in etcd, and Kubernetes bounds that object independently of
+`MAX_PIPELINE_SPEC_BYTES`. A pipeline that the database pipeline store accepts can therefore be too
+large for the Kubernetes pipeline store. Without the KFP check, Kubernetes rejects objects with:
+
+| Object size | Rejected by | Error returned by Kubernetes |
+| --- | --- | --- |
+| Above 1.5 MiB | etcd `--max-request-bytes` (default 1572864 bytes) | `etcdserver: request is too large` |
+| Above 2 MiB | Kubernetes API server etcd client send limit (not configurable) | `trying to send message larger than max` |
+| Above 3 MiB | Kubernetes API server request body limit (not configurable), before admission webhooks | `Request entity too large: limit is 3145728` |
+
+The `PipelineVersion` validating webhook measures the serialized object and rejects objects larger than
+`MAX_PIPELINE_VERSION_OBJECT_BYTES` with a message that reports the object size and the limit. Pipeline
+versions created through the KFP API that are rejected for their size by the webhook or by Kubernetes
+return `InvalidArgument` instead of an internal error. This setting has no effect when the database
+pipeline store is used.
+
+| Setting | What it bounds | Default | Supported range |
+| --- | --- | --- | --- |
+| `MAX_PIPELINE_VERSION_OBJECT_BYTES` | Serialized `PipelineVersion` objects in the Kubernetes pipeline store | 1572864 (1.5 MiB) | 1–2097152 bytes (2 MiB) |
+
+Set it as an environment variable on the `ml-pipeline` deployment or as a key in the API server
+`config.json`. The webhook reads the value on every request, so edits to a mounted `config.json` apply
+without a restart; environment variable changes apply when the deployment rolls out. The upper bound
+is the Kubernetes API server etcd client send limit, which cannot be raised. Invalid or out-of-range
+values, including JSON arrays, objects, and booleans in `config.json`, prevent the webhook from starting.
+If introduced later by a configuration reload, they cause pipeline version creation to fail with an
+internal server error that names the setting, because the problem is in the server configuration
+rather than the submitted pipeline.
+
+Raise this value only if the cluster's etcd `--max-request-bytes` has been raised to match; it does
+not change any etcd or Kubernetes limit. Most managed Kubernetes services do not allow changing the
+etcd limit. Client-side `kubectl apply` stores the whole object in the
+`kubectl.kubernetes.io/last-applied-configuration` annotation, and Kubernetes limits all annotations
+on an object to 256 KiB, so client-side apply fails for pipeline versions above roughly 256 KiB. Use
+`kubectl create` or `kubectl apply --server-side` instead. Prefer moving large embedded artifacts,
+notebooks, and code to container images or object storage.
+
 ## Recurring runs and custom service accounts
 
 See [Service accounts for recurring runs](scheduled-service-accounts.md) for

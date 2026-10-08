@@ -17,9 +17,11 @@ package common
 import (
 	"errors"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/kubeflow/pipelines/backend/src/common/util"
+	"github.com/spf13/viper"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 )
@@ -67,4 +69,94 @@ func TestSizeLimitErrorIsSafeAndInvalidArgument(t *testing.T) {
 	var userErr *util.UserError
 	require.True(t, errors.As(err, &userErr))
 	require.Equal(t, codes.InvalidArgument, userErr.ExternalStatusCode())
+}
+
+func setPipelineVersionObjectSizeConfig(t *testing.T, value interface{}) {
+	t.Helper()
+	viper.Set(MaxPipelineVersionObjectBytesConfig, value)
+	t.Cleanup(func() { viper.Set(MaxPipelineVersionObjectBytesConfig, nil) })
+}
+
+func TestPipelineVersionObjectSizeLimit_Defaults(t *testing.T) {
+	for _, value := range []interface{}{nil, "", "  "} {
+		setPipelineVersionObjectSizeConfig(t, value)
+		limit, err := GetPipelineVersionObjectSizeLimit()
+		require.NoError(t, err)
+		require.Equal(t, DefaultPipelineVersionObjectBytes, limit)
+	}
+}
+
+func TestPipelineVersionObjectSizeLimit_AcceptsValuesUpToKubernetesLimit(t *testing.T) {
+	for _, value := range []interface{}{"1", "2097152", 2097152, strconv.Itoa(MaximumPipelineVersionObjectBytes)} {
+		setPipelineVersionObjectSizeConfig(t, value)
+		limit, err := GetPipelineVersionObjectSizeLimit()
+		require.NoError(t, err)
+		require.Equal(t, viper.GetInt(MaxPipelineVersionObjectBytesConfig), limit)
+	}
+}
+
+func TestPipelineVersionObjectSizeLimit_RejectsValuesAboveKubernetesLimit(t *testing.T) {
+	for _, value := range []string{strconv.Itoa(MaximumPipelineVersionObjectBytes + 1), "3145728", strconv.Itoa(MaximumPipelineSizeBytes)} {
+		t.Run(value, func(t *testing.T) {
+			setPipelineVersionObjectSizeConfig(t, value)
+			_, err := GetPipelineVersionObjectSizeLimit()
+			require.ErrorContains(t, err, MaxPipelineVersionObjectBytesConfig)
+			require.ErrorContains(t, err, "must not exceed 2097152 bytes (2 MiB)")
+			require.ErrorContains(t, err, "send to etcd")
+		})
+	}
+}
+
+func TestPipelineVersionObjectSizeLimit_RejectsInvalidValues(t *testing.T) {
+	for _, value := range []string{"0", "-1", "1.5MiB", "1.5", "9223372036854775808"} {
+		t.Run(value, func(t *testing.T) {
+			setPipelineVersionObjectSizeConfig(t, value)
+			_, err := GetPipelineVersionObjectSizeLimit()
+			require.ErrorContains(t, err, MaxPipelineVersionObjectBytesConfig)
+			require.ErrorContains(t, err, "positive integer")
+			require.ErrorContains(t, err, strconv.Itoa(DefaultPipelineVersionObjectBytes))
+		})
+	}
+}
+
+func TestPipelineVersionObjectSizeLimit_ReadsEnvironment(t *testing.T) {
+	viper.AutomaticEnv()
+	t.Setenv(MaxPipelineVersionObjectBytesConfig, "2097152")
+	limit, err := GetPipelineVersionObjectSizeLimit()
+	require.NoError(t, err)
+	require.Equal(t, 2097152, limit)
+}
+
+func TestPipelineVersionObjectSizeLimit_ConfigFileValues(t *testing.T) {
+	testCases := []struct {
+		config        string
+		expectedLimit int
+		expectedError string
+	}{
+		{`{"MAX_PIPELINE_VERSION_OBJECT_BYTES": 1024}`, 1024, ""},
+		{`{"MAX_PIPELINE_VERSION_OBJECT_BYTES": "1024"}`, 1024, ""},
+		{`{"MAX_PIPELINE_VERSION_OBJECT_BYTES": 2097152}`, 2097152, ""},
+		{`{"MAX_PIPELINE_VERSION_OBJECT_BYTES": [1024]}`, 0, "unsupported type []interface {}"},
+		{`{"MAX_PIPELINE_VERSION_OBJECT_BYTES": {"bytes": 1024}}`, 0, "unsupported type map[string]interface {}"},
+		{`{"MAX_PIPELINE_VERSION_OBJECT_BYTES": true}`, 0, "unsupported type bool"},
+		{`{"MAX_PIPELINE_VERSION_OBJECT_BYTES": 1024.5}`, 0, "positive integer"},
+		{`{"MAX_PIPELINE_VERSION_OBJECT_BYTES": 2097153}`, 0, "must not exceed 2097152 bytes"},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.config, func(t *testing.T) {
+			configFile := viper.New()
+			configFile.SetConfigType("json")
+			require.NoError(t, configFile.ReadConfig(strings.NewReader(testCase.config)))
+			setPipelineVersionObjectSizeConfig(t, configFile.Get(MaxPipelineVersionObjectBytesConfig))
+
+			limit, err := GetPipelineVersionObjectSizeLimit()
+			if testCase.expectedError != "" {
+				require.ErrorContains(t, err, testCase.expectedError)
+				require.ErrorContains(t, err, MaxPipelineVersionObjectBytesConfig)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, testCase.expectedLimit, limit)
+		})
+	}
 }

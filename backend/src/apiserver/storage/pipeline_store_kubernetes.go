@@ -864,11 +864,35 @@ func (k *PipelineStoreKubernetes) createPipelineVersionWithPipeline(ctx context.
 		)
 	} else if k8serrors.IsInvalid(err) && strings.Contains(err.Error(), "metadata.name") {
 		return nil, util.NewBadKubernetesNameError("pipeline version")
+	} else if isKubernetesObjectTooLargeError(err) {
+		return nil, util.NewInvalidInputErrorWithDetails(err, fmt.Sprintf(
+			"The pipeline version is too large to store as a Kubernetes object: %v. "+
+				"Kubernetes stores each pipeline version as a single etcd object, which is limited to 1.5 MiB by default "+
+				"regardless of %s. Move large embedded artifacts, notebooks, or Python code into a container image or object store, "+
+				"or use the database pipeline store.",
+			err, common.MaxPipelineSpecBytesEnv,
+		))
+	} else if k8serrors.IsBadRequest(err) {
+		// The validating webhook rejected the object; its message is already user-facing.
+		return nil, util.NewInvalidInputErrorWithDetails(err, err.Error())
 	} else if err != nil {
 		return nil, util.NewInternalServerError(err, "Failed to create the pipeline version")
 	}
 
 	return k8sPipelineVersion.ToModel()
+}
+
+// isKubernetesObjectTooLargeError reports whether Kubernetes rejected an object because of its size:
+// etcd's --max-request-bytes, the API server's 2 MiB etcd client send limit (both after admission),
+// or the API server's 3 MiB request body limit (HTTP 413, before admission).
+func isKubernetesObjectTooLargeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return k8serrors.IsRequestEntityTooLargeError(err) ||
+		strings.Contains(message, "etcdserver: request is too large") ||
+		strings.Contains(message, "trying to send message larger than max")
 }
 
 func (k *PipelineStoreKubernetes) UpdatePipelineFields(pipelineID string, displayName string, tags map[string]string) error {

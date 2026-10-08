@@ -609,6 +609,10 @@ func buildHTTPRouter(handlerDeps HTTPRouterDeps, grpcGatewayHandler http.Handler
 func startWebhook(client ctrlclient.Client, clientNoCahe ctrlclient.Client, wg *sync.WaitGroup) (*http.Server, error) {
 	glog.Info("Starting the Kubernetes webhooks...")
 
+	if _, err := common.GetPipelineVersionObjectSizeLimit(); err != nil {
+		return nil, fmt.Errorf("invalid PipelineVersion object size limit: %w", err)
+	}
+
 	topMux := mux.NewRouter()
 
 	pvValidateWebhook, pvMutateWebhook, err := webhook.NewPipelineVersionWebhook(client, clientNoCahe)

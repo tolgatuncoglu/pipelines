@@ -18,6 +18,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -29,6 +30,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -725,4 +727,98 @@ func getClientWithTwoPipelines() (client.Client, client.Client) {
 		Build()
 
 	return k8sClient, k8sClient
+}
+
+func TestCreatePipelineVersion_MapsKubernetesCreateErrors(t *testing.T) {
+	podNamespace := viper.Get("POD_NAMESPACE")
+	viper.Set("POD_NAMESPACE", "Test")
+	defer viper.Set("POD_NAMESPACE", podNamespace)
+
+	testCases := []struct {
+		name            string
+		createError     error
+		expectedCode    codes.Code
+		expectedMessage string
+	}{
+		// The size errors match the Status responses of a Kubernetes v1.37 kind cluster.
+		{
+			name:            "etcd request too large",
+			createError:     &k8serrors.StatusError{ErrStatus: metav1.Status{Status: metav1.StatusFailure, Code: 500, Message: "etcdserver: request is too large"}},
+			expectedCode:    codes.InvalidArgument,
+			expectedMessage: "too large to store as a Kubernetes object",
+		},
+		{
+			name: "API server etcd client send limit",
+			createError: &k8serrors.StatusError{ErrStatus: metav1.Status{Status: metav1.StatusFailure, Code: 500,
+				Message: "rpc error: code = ResourceExhausted desc = trying to send message larger than max (2097703 vs. 2097152)"}},
+			expectedCode:    codes.InvalidArgument,
+			expectedMessage: "too large to store as a Kubernetes object",
+		},
+		{
+			name:            "API server request entity too large",
+			createError:     k8serrors.NewRequestEntityTooLargeError("limit is 3145728"),
+			expectedCode:    codes.InvalidArgument,
+			expectedMessage: "too large to store as a Kubernetes object",
+		},
+		{
+			name:            "validating webhook denial",
+			createError:     k8serrors.NewBadRequest("admission webhook denied the request: The PipelineVersion object is 2000000 bytes"),
+			expectedCode:    codes.InvalidArgument,
+			expectedMessage: "The PipelineVersion object is 2000000 bytes",
+		},
+		{
+			// The API server keeps a webhook's 5xx status, so webhook dependency failures stay server errors.
+			name: "validating webhook infrastructure failure",
+			createError: &k8serrors.StatusError{ErrStatus: metav1.Status{Status: metav1.StatusFailure, Code: 500, Reason: metav1.StatusReasonInternalError,
+				Message: `admission webhook "pipelineversions.pipelines.kubeflow.org" denied the request: Internal error occurred: failed to get the Pipeline Test/my-pipeline: Kubernetes API temporarily unavailable`}},
+			expectedCode:    codes.Internal,
+			expectedMessage: "Internal Server Error",
+		},
+		{
+			name:            "unexpected error",
+			createError:     k8serrors.NewInternalError(fmt.Errorf("simulated failure")),
+			expectedCode:    codes.Internal,
+			expectedMessage: "Internal Server Error",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			require.NoError(t, v2beta1.AddToScheme(scheme))
+
+			pipeline := &v2beta1.Pipeline{
+				ObjectMeta: metav1.ObjectMeta{
+					UID:       DefaultFakePipelineIdThree,
+					Name:      "my-pipeline",
+					Namespace: "Test",
+				},
+			}
+			k8sClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(pipeline).
+				WithInterceptorFuncs(interceptor.Funcs{
+					Create: func(ctx context.Context, client client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+						if _, ok := obj.(*v2beta1.PipelineVersion); ok {
+							return testCase.createError
+						}
+						return client.Create(ctx, obj, opts...)
+					},
+				}).
+				Build()
+
+			store := NewPipelineStoreKubernetes(k8sClient, k8sClient)
+
+			_, err := store.CreatePipelineVersion(&model.PipelineVersion{
+				Name:         "v1",
+				PipelineId:   DefaultFakePipelineIdThree,
+				PipelineSpec: model.LargeText(getBasicPipelineSpecYAML()),
+			})
+			require.Error(t, err)
+			var userError *util.UserError
+			require.True(t, errors.As(err, &userError))
+			assert.Equal(t, testCase.expectedCode, userError.ExternalStatusCode())
+			assert.Contains(t, userError.ExternalMessage(), testCase.expectedMessage)
+		})
+	}
 }

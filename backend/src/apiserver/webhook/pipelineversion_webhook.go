@@ -15,10 +15,12 @@ package webhook
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"reflect"
 
+	"github.com/golang/glog"
 	"github.com/kubeflow/pipelines/backend/src/apiserver/common"
 	"github.com/kubeflow/pipelines/backend/src/apiserver/template"
 	k8sapi "github.com/kubeflow/pipelines/backend/src/crd/kubernetes/v2beta1"
@@ -48,6 +50,8 @@ type PipelineVersionsWebhook struct {
 
 var _ ctrladmission.CustomValidator = &PipelineVersionsWebhook{}
 
+// newBadRequestError reports a problem with the submitted object. Failures of the webhook's own
+// dependencies or configuration use apierrors.NewInternalError so callers can tell them apart.
 func newBadRequestError(msg string) *apierrors.StatusError {
 	return &apierrors.StatusError{
 		ErrStatus: metav1.Status{
@@ -67,7 +71,7 @@ func (p *PipelineVersionsWebhook) getPipeline(ctx context.Context, namespace str
 	}
 
 	if !apierrors.IsNotFound(err) {
-		return nil, newBadRequestError(fmt.Sprintf("Failed to get the Pipeline %s/%s: %v", namespace, name, err))
+		return nil, apierrors.NewInternalError(fmt.Errorf("failed to get the Pipeline %s/%s: %w", namespace, name, err))
 	}
 
 	// Fallback to not using the cache
@@ -77,7 +81,7 @@ func (p *PipelineVersionsWebhook) getPipeline(ctx context.Context, namespace str
 			return nil, newBadRequestError("The spec.pipelineName doesn't map to an existing Pipeline object")
 		}
 
-		return nil, newBadRequestError(fmt.Sprintf("Failed to get the Pipeline %s/%s: %v", namespace, name, err))
+		return nil, apierrors.NewInternalError(fmt.Errorf("failed to get the Pipeline %s/%s: %w", namespace, name, err))
 	}
 
 	return pipeline, nil
@@ -89,6 +93,12 @@ func (p *PipelineVersionsWebhook) ValidateCreate(
 	pipelineVersion, ok := obj.(*k8sapi.PipelineVersion)
 	if !ok {
 		return nil, newBadRequestError(fmt.Sprintf("Expected a PipelineVersion object but got %T", pipelineVersion))
+	}
+
+	// Check the size first so an oversized object fails with an actionable message here instead of
+	// a generic "request is too large" error from etcd after admission.
+	if err := validatePipelineVersionObjectSize(pipelineVersion); err != nil {
+		return nil, err
 	}
 
 	modelPipelineVersion, err := pipelineVersion.ToModel()
@@ -108,6 +118,31 @@ func (p *PipelineVersionsWebhook) ValidateCreate(
 	}
 
 	return nil, nil
+}
+
+// validatePipelineVersionObjectSize reads the limit on every call so configuration changes apply
+// without restarting the API server.
+func validatePipelineVersionObjectSize(pipelineVersion *k8sapi.PipelineVersion) error {
+	limit, err := common.GetPipelineVersionObjectSizeLimit()
+	if err != nil {
+		return apierrors.NewInternalError(fmt.Errorf("the PipelineVersion object size limit is misconfigured: %w. Ask an administrator to fix it", err))
+	}
+
+	// Measure the whole object Kubernetes persists, including metadata such as the
+	// kubectl.kubernetes.io/last-applied-configuration annotation.
+	serialized, err := json.Marshal(pipelineVersion)
+	if err != nil {
+		return apierrors.NewInternalError(fmt.Errorf("failed to serialize the PipelineVersion object: %w", err))
+	}
+	if len(serialized) <= limit {
+		return nil
+	}
+
+	glog.Warningf("size_limit_exceeded control=pipeline_version_object limit_bytes=%d object_bytes=%d setting=%s",
+		limit, len(serialized), common.MaxPipelineVersionObjectBytesConfig)
+	return newBadRequestError(fmt.Sprintf("The PipelineVersion object is %d bytes (%.2f MiB). %s",
+		len(serialized), float64(len(serialized))/(1<<20),
+		common.SizeLimitErrorMessage("pipeline_version_object", int64(limit), common.MaxPipelineVersionObjectBytesConfig)))
 }
 
 func (p *PipelineVersionsWebhook) ValidateUpdate(_ context.Context, oldObj, newObj runtime.Object) (ctrladmission.Warnings, error) {
