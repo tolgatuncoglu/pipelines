@@ -31,6 +31,12 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
+// PipelineVersionRejectedCause marks admission denials caused by a problem with the submitted
+// PipelineVersion. The KFP webhook attaches it with its own message, and the Kubernetes API server
+// passes it through unchanged, so the KFP API can report that message as invalid input without
+// parsing error strings. Denials without it, including the webhook's own failures, are server errors.
+const PipelineVersionRejectedCause metav1.CauseType = "pipelines.kubeflow.org/PipelineVersionRejected"
+
 // PipelineVersionSpec defines the desired state of PipelineVersion.
 type PipelineVersionSpec struct {
 	Description   string `json:"description,omitempty"`

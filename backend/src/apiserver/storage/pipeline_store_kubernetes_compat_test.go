@@ -18,10 +18,13 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/golang/glog"
+	"github.com/kubeflow/pipelines/backend/src/apiserver/common"
 	"github.com/kubeflow/pipelines/backend/src/apiserver/list"
 	"github.com/kubeflow/pipelines/backend/src/apiserver/model"
 	"github.com/kubeflow/pipelines/backend/src/common/util"
@@ -29,6 +32,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -725,4 +729,163 @@ func getClientWithTwoPipelines() (client.Client, client.Client) {
 		Build()
 
 	return k8sClient, k8sClient
+}
+
+// webhookDenial builds the error the Kubernetes API server returns when an admission webhook denies a
+// request: it keeps the webhook's status and prefixes the message (see ToStatusErr in k8s.io/apiserver).
+func webhookDenial(status metav1.Status) error {
+	status.Message = `admission webhook "pipelineversions.pipelines.kubeflow.org" denied the request: ` + status.Message
+	return &k8serrors.StatusError{ErrStatus: status}
+}
+
+func TestCreatePipelineVersion_MapsKubernetesCreateErrors(t *testing.T) {
+	podNamespace := viper.Get("POD_NAMESPACE")
+	viper.Set("POD_NAMESPACE", "Test")
+	defer viper.Set("POD_NAMESPACE", podNamespace)
+
+	const webhookMessage = "The pipeline version is too large to store in Kubernetes: the PipelineVersion object is 2000000 bytes"
+	sizeAdvice := common.PipelineVersionRejectedByKubernetesMessage()
+
+	testCases := []struct {
+		name            string
+		createError     error
+		expectedCode    codes.Code
+		expectedMessage string
+	}{
+		// The size errors match the Status responses of a Kubernetes v1.37 kind cluster.
+		{
+			name:            "etcd request too large",
+			createError:     &k8serrors.StatusError{ErrStatus: metav1.Status{Status: metav1.StatusFailure, Code: 500, Message: "etcdserver: request is too large"}},
+			expectedCode:    codes.InvalidArgument,
+			expectedMessage: sizeAdvice,
+		},
+		{
+			name: "API server etcd client send limit",
+			createError: &k8serrors.StatusError{ErrStatus: metav1.Status{Status: metav1.StatusFailure, Code: 500,
+				Message: "rpc error: code = ResourceExhausted desc = trying to send message larger than max (2097703 vs. 2097152)"}},
+			expectedCode:    codes.InvalidArgument,
+			expectedMessage: sizeAdvice,
+		},
+		{
+			name:            "API server request entity too large",
+			createError:     k8serrors.NewRequestEntityTooLargeError("limit is 3145728"),
+			expectedCode:    codes.InvalidArgument,
+			expectedMessage: sizeAdvice,
+		},
+		{
+			name: "KFP webhook rejects the submitted object",
+			createError: webhookDenial(metav1.Status{Status: metav1.StatusFailure, Code: 400, Reason: metav1.StatusReasonBadRequest,
+				Message: webhookMessage,
+				Details: &metav1.StatusDetails{Causes: []metav1.StatusCause{{Type: v2beta1.PipelineVersionRejectedCause, Message: webhookMessage}}}}),
+			expectedCode:    codes.InvalidArgument,
+			expectedMessage: webhookMessage,
+		},
+		{
+			// Only the KFP cause marks a denial as invalid input; any other 400 is a server-side problem.
+			name:            "bad request without the KFP cause",
+			createError:     k8serrors.NewBadRequest("the server rejected our request for an unknown reason"),
+			expectedCode:    codes.Internal,
+			expectedMessage: "Internal Server Error",
+		},
+		{
+			// The API server keeps a webhook's 5xx status, so webhook dependency failures stay server errors.
+			name: "validating webhook infrastructure failure",
+			createError: webhookDenial(metav1.Status{Status: metav1.StatusFailure, Code: 500, Reason: metav1.StatusReasonInternalError,
+				Message: "Internal error occurred: failed to get the Pipeline Test/my-pipeline: Kubernetes API temporarily unavailable"}),
+			expectedCode:    codes.Internal,
+			expectedMessage: "Internal Server Error",
+		},
+		{
+			name:            "unexpected error",
+			createError:     k8serrors.NewInternalError(fmt.Errorf("simulated failure")),
+			expectedCode:    codes.Internal,
+			expectedMessage: "Internal Server Error",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			require.NoError(t, v2beta1.AddToScheme(scheme))
+
+			pipeline := &v2beta1.Pipeline{
+				ObjectMeta: metav1.ObjectMeta{
+					UID:       DefaultFakePipelineIdThree,
+					Name:      "my-pipeline",
+					Namespace: "Test",
+				},
+			}
+			k8sClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(pipeline).
+				WithInterceptorFuncs(interceptor.Funcs{
+					Create: func(ctx context.Context, client client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+						if _, ok := obj.(*v2beta1.PipelineVersion); ok {
+							return testCase.createError
+						}
+						return client.Create(ctx, obj, opts...)
+					},
+				}).
+				Build()
+
+			store := NewPipelineStoreKubernetes(k8sClient, k8sClient)
+
+			_, err := store.CreatePipelineVersion(&model.PipelineVersion{
+				Name:         "v1",
+				PipelineId:   DefaultFakePipelineIdThree,
+				PipelineSpec: model.LargeText(getBasicPipelineSpecYAML()),
+			})
+			require.Error(t, err)
+			var userError *util.UserError
+			require.True(t, errors.As(err, &userError))
+			assert.Equal(t, testCase.expectedCode, userError.ExternalStatusCode())
+			assert.Contains(t, userError.ExternalMessage(), testCase.expectedMessage)
+			assert.NotContains(t, userError.ExternalMessage(), "admission webhook", "clients see the KFP message, not the API server's wrapping")
+			// The gRPC status message shown by clients contains each piece of text exactly once.
+			grpcMessage := userError.GRPCStatus().Message()
+			if testCase.expectedCode == codes.InvalidArgument {
+				assert.Equal(t, 1, strings.Count(grpcMessage, testCase.expectedMessage), grpcMessage)
+			}
+			if kubernetesMessage := testCase.createError.Error(); testCase.expectedMessage == sizeAdvice {
+				assert.Equal(t, 1, strings.Count(grpcMessage, kubernetesMessage), grpcMessage)
+			}
+		})
+	}
+}
+
+func TestCreatePipelineAndPipelineVersion_DeletesPipelineWhenVersionIsRejected(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, v2beta1.AddToScheme(scheme))
+
+	rejectVersions := true
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Create: func(ctx context.Context, client client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				if _, ok := obj.(*v2beta1.PipelineVersion); ok && rejectVersions {
+					return k8serrors.NewBadRequest("admission webhook denied the request: The pipeline version is too large to store in Kubernetes")
+				}
+				return client.Create(ctx, obj, opts...)
+			},
+		}).
+		Build()
+	store := NewPipelineStoreKubernetes(k8sClient, k8sClient)
+
+	newRequest := func() (*model.Pipeline, *model.PipelineVersion) {
+		return &model.Pipeline{Name: "large-pipeline", Namespace: "Test"},
+			&model.PipelineVersion{Name: "large-pipeline", PipelineSpec: model.LargeText(getBasicPipelineSpecYAML())}
+	}
+
+	_, _, err := store.CreatePipelineAndPipelineVersion(newRequest())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "too large to store in Kubernetes", "the version error is returned, not a cleanup error")
+
+	pipelines := &v2beta1.PipelineList{}
+	require.NoError(t, k8sClient.List(context.TODO(), pipelines))
+	assert.Empty(t, pipelines.Items, "the Pipeline created for the rejected version is deleted")
+
+	// The user fixes the pipeline and retries with the same name.
+	rejectVersions = false
+	_, _, err = store.CreatePipelineAndPipelineVersion(newRequest())
+	require.NoError(t, err)
 }

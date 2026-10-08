@@ -433,6 +433,57 @@ To return to defaults, remove the overrides and roll out the deployment. Before
 lowering `MAX_PIPELINE_SPEC_BYTES`, check stored pipelines accepted under the higher
 limit: object-store specifications may no longer be readable for subsequent execution. This
 setting does not add a new size check to the existing direct database-spec read path.
+
+### Kubernetes pipeline store object size limit
+
+When the API server uses the Kubernetes pipeline store, each pipeline version is persisted as a
+single `PipelineVersion` object in etcd, and Kubernetes bounds that object independently of
+`MAX_PIPELINE_SPEC_BYTES`. A pipeline that the database pipeline store accepts can therefore be too
+large for the Kubernetes pipeline store. Without the KFP check, Kubernetes rejects objects with:
+
+| Object size | Rejected by | Error returned by Kubernetes |
+| --- | --- | --- |
+| Above 1.5 MiB | etcd `--max-request-bytes` (default 1572864 bytes) | `etcdserver: request is too large` |
+| Above 2 MiB | Kubernetes API server etcd client send limit (not configurable) | `trying to send message larger than max` |
+| Above 3 MiB | Kubernetes API server request body limit (not configurable), before admission webhooks | `Request entity too large: limit is 3145728` |
+
+The `PipelineVersion` validating webhook measures the serialized object and rejects objects larger than
+`MAX_PIPELINE_VERSION_OBJECT_BYTES` with a message that reports the object size and the limit. Pipeline
+versions created through the KFP API that are rejected for their size by the webhook or by Kubernetes
+return `InvalidArgument` instead of an internal error. This setting has no effect when the database
+pipeline store is used. The webhook checks size only when a `PipelineVersion` is created. The
+pipeline spec cannot change after creation, so updates through the KFP API cannot grow the object
+past the limit. An update that adds large labels or annotations, for example with `kubectl`, is
+still bounded by Kubernetes and fails with the Kubernetes error.
+
+| Setting | What it bounds | Default | Supported range |
+| --- | --- | --- | --- |
+| `MAX_PIPELINE_VERSION_OBJECT_BYTES` | Serialized `PipelineVersion` objects in the Kubernetes pipeline store | 1556480 (1.5 MiB − 16 KiB) | 1–2080768 bytes (2 MiB − 16 KiB) |
+
+Both the default and the maximum sit 16 KiB below the Kubernetes limit they derive from. etcd counts
+the storage key and transaction framing on top of the object itself, so an object exactly at the
+Kubernetes limit would still be rejected. The real overhead is a few hundred bytes; 16 KiB leaves a
+wide margin. If an object still reaches a Kubernetes size limit, for example because the cluster runs
+a smaller etcd limit than its default, the KFP API returns `InvalidArgument` with a size message
+rather than an internal error.
+
+Set it as an environment variable on the `ml-pipeline` deployment or as a key in the API server
+`config.json`. The webhook reads the value on every request, so edits to a mounted `config.json` apply
+without a restart; environment variable changes apply when the deployment rolls out. The upper bound
+follows from the Kubernetes API server etcd client send limit, which cannot be raised. Invalid or out-of-range
+values, including JSON arrays, objects, and booleans in `config.json`, prevent the webhook from starting.
+If introduced later by a configuration reload, they cause pipeline version creation to fail with an
+internal server error that names the setting, because the problem is in the server configuration
+rather than the submitted pipeline.
+
+Raise this value only if the cluster's etcd `--max-request-bytes` has been raised to match, and keep it
+at least 16 KiB below that etcd value. This setting does not change any etcd or Kubernetes limit. Most
+managed Kubernetes services do not allow changing the etcd limit. Client-side `kubectl apply` stores the whole object in the
+`kubectl.kubernetes.io/last-applied-configuration` annotation, and Kubernetes limits all annotations
+on an object to 256 KiB, so client-side apply fails for pipeline versions above roughly 256 KiB. Use
+`kubectl create` or `kubectl apply --server-side` instead. Prefer moving large embedded artifacts,
+notebooks, and code to container images or object storage.
+
 ## Recurring runs and custom service accounts
 
 See [Service accounts for recurring runs](scheduled-service-accounts.md) for

@@ -14,17 +14,31 @@ limitations under the License.
 package webhook
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
 
+	"github.com/kubeflow/pipelines/backend/src/apiserver/common"
 	k8sapi "github.com/kubeflow/pipelines/backend/src/crd/kubernetes/v2beta1"
+	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	admissionv1 "k8s.io/api/admission/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/uuid"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	k8sfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 // jsonToInterface marshals a value to JSON and unmarshals it back to interface{},
@@ -331,4 +345,199 @@ func TestPipelineVersionWebhook_Default_TruncatesLongPipelineNameLabel(t *testin
 	got, ok := pipelineVersion.Labels["pipelines.kubeflow.org/pipeline"]
 	require.True(t, ok, "expected pipeline label to be set")
 	assert.Equal(t, expectedTrunc, got)
+}
+
+func newPipelineVersionWithAnnotation(specJSON interface{}, annotationBytes int) *k8sapi.PipelineVersion {
+	return &k8sapi.PipelineVersion{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-pipeline-v1",
+			Namespace: "default",
+			Annotations: map[string]string{
+				"kubectl.kubernetes.io/last-applied-configuration": strings.Repeat("x", annotationBytes),
+			},
+		},
+		Spec: k8sapi.PipelineVersionSpec{
+			PipelineName: "test-pipeline",
+			PipelineSpec: k8sapi.IRSpec{Value: specJSON},
+		},
+	}
+}
+
+func setPipelineVersionObjectSizeConfig(t *testing.T, value interface{}) {
+	t.Helper()
+	viper.Set(common.MaxPipelineVersionObjectBytesConfig, value)
+	t.Cleanup(func() { viper.Set(common.MaxPipelineVersionObjectBytesConfig, nil) })
+}
+
+func TestPipelineVersionWebhook_ValidateCreate_RejectsOversizedObject(t *testing.T) {
+	setPipelineVersionObjectSizeConfig(t, nil)
+	pipelineWebhook, validPipelineSpecJSON := setupPipelineWebhookTest(t)
+
+	// The annotation alone exceeds the default limit, so the whole persisted object is measured,
+	// not just the pipeline spec.
+	pipelineVersion := newPipelineVersionWithAnnotation(validPipelineSpecJSON, common.DefaultPipelineVersionObjectBytes)
+
+	_, err := pipelineWebhook.ValidateCreate(context.TODO(), pipelineVersion)
+	require.Error(t, err)
+	assert.True(t, apierrors.IsBadRequest(err))
+	assert.Contains(t, err.Error(), "The pipeline version is too large to store in Kubernetes")
+	assert.Contains(t, err.Error(), "the limit is 1556480 bytes (1.48 MiB)")
+	assert.Contains(t, err.Error(), "single etcd object")
+	assert.Contains(t, err.Error(), common.MaxPipelineVersionObjectBytesConfig)
+}
+
+func TestPipelineVersionWebhook_ValidateCreate_AppliesConfigChangesWithoutRestart(t *testing.T) {
+	pipelineWebhook, validPipelineSpecJSON := setupPipelineWebhookTest(t)
+	pipelineVersion := newPipelineVersionWithAnnotation(validPipelineSpecJSON, 4096)
+
+	setPipelineVersionObjectSizeConfig(t, "1024")
+	_, err := pipelineWebhook.ValidateCreate(context.TODO(), pipelineVersion)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "the limit is 1024 bytes")
+
+	setPipelineVersionObjectSizeConfig(t, "65536")
+	_, err = pipelineWebhook.ValidateCreate(context.TODO(), pipelineVersion)
+	assert.NoError(t, err)
+}
+
+func TestPipelineVersionWebhook_ValidateCreate_AllowsObjectsUpToKubernetesLimit(t *testing.T) {
+	pipelineWebhook, validPipelineSpecJSON := setupPipelineWebhookTest(t)
+	setPipelineVersionObjectSizeConfig(t, strconv.Itoa(common.MaximumPipelineVersionObjectBytes))
+
+	pipelineVersion := newPipelineVersionWithAnnotation(validPipelineSpecJSON, 2000<<10)
+	_, err := pipelineWebhook.ValidateCreate(context.TODO(), pipelineVersion)
+	assert.NoError(t, err)
+}
+
+func TestPipelineVersionWebhook_ValidateCreate_RejectsLimitAboveKubernetesLimit(t *testing.T) {
+	pipelineWebhook, validPipelineSpecJSON := setupPipelineWebhookTest(t)
+	setPipelineVersionObjectSizeConfig(t, strconv.Itoa(common.MaximumPipelineVersionObjectBytes+1))
+
+	_, err := pipelineWebhook.ValidateCreate(context.TODO(), newPipelineVersionWithAnnotation(validPipelineSpecJSON, 0))
+	require.Error(t, err)
+	assert.True(t, apierrors.IsInternalError(err), "a misconfigured limit is not the caller's fault")
+	assert.Contains(t, err.Error(), "misconfigured")
+	assert.Contains(t, err.Error(), "must not exceed 2080768 bytes")
+}
+
+func TestPipelineVersionWebhook_ValidateCreate_RejectsInvalidLimit(t *testing.T) {
+	pipelineWebhook, validPipelineSpecJSON := setupPipelineWebhookTest(t)
+	setPipelineVersionObjectSizeConfig(t, "1.5MiB")
+
+	_, err := pipelineWebhook.ValidateCreate(context.TODO(), newPipelineVersionWithAnnotation(validPipelineSpecJSON, 0))
+	require.Error(t, err)
+	assert.True(t, apierrors.IsInternalError(err))
+	assert.Contains(t, err.Error(), common.MaxPipelineVersionObjectBytesConfig)
+}
+
+func newPipelineWebhookWithPipelineLookupError(t *testing.T, lookupErr error) *PipelineVersionsWebhook {
+	scheme := runtime.NewScheme()
+	require.NoError(t, k8sapi.AddToScheme(scheme))
+	failingClient := k8sfake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(interceptor.Funcs{
+		Get: func(_ context.Context, _ client.WithWatch, _ client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
+			return lookupErr
+		},
+	}).Build()
+	return &PipelineVersionsWebhook{Client: failingClient, ClientNoCache: failingClient}
+}
+
+func TestPipelineVersionWebhook_Default_ClassifiesPipelineLookupErrors(t *testing.T) {
+	pipelineVersion := &k8sapi.PipelineVersion{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-pipeline-v1", Namespace: "default"},
+		Spec:       k8sapi.PipelineVersionSpec{PipelineName: "test-pipeline"},
+	}
+	pipelineResource := schema.GroupResource{Group: k8sapi.GroupVersion.Group, Resource: "pipelines"}
+
+	testCases := []struct {
+		name           string
+		lookupErr      error
+		expectedStatus int32
+	}{
+		{"missing pipeline is a caller error", apierrors.NewNotFound(pipelineResource, "test-pipeline"), http.StatusBadRequest},
+		{"unavailable Kubernetes API is a server error", apierrors.NewServiceUnavailable("Kubernetes API temporarily unavailable"), http.StatusInternalServerError},
+		{"unexpected lookup failure is a server error", errors.New("connection reset"), http.StatusInternalServerError},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			pipelineWebhook := newPipelineWebhookWithPipelineLookupError(t, testCase.lookupErr)
+			err := pipelineWebhook.Default(context.TODO(), pipelineVersion.DeepCopy())
+			var statusErr apierrors.APIStatus
+			require.True(t, errors.As(err, &statusErr))
+			assert.Equal(t, testCase.expectedStatus, statusErr.Status().Code)
+		})
+	}
+}
+
+// sendAdmissionReview exercises the HTTP handlers returned by NewPipelineVersionWebhook, which is
+// what the Kubernetes API server calls, and returns the admission response.
+func sendAdmissionReview(t *testing.T, handler http.Handler, pipelineVersion *k8sapi.PipelineVersion) *admissionv1.AdmissionResponse {
+	t.Helper()
+	pipelineVersion.TypeMeta = metav1.TypeMeta{APIVersion: k8sapi.GroupVersion.String(), Kind: "PipelineVersion"}
+	rawObject, err := json.Marshal(pipelineVersion)
+	require.NoError(t, err)
+	review := admissionv1.AdmissionReview{
+		TypeMeta: metav1.TypeMeta{APIVersion: "admission.k8s.io/v1", Kind: "AdmissionReview"},
+		Request: &admissionv1.AdmissionRequest{
+			UID:       types.UID("test-request"),
+			Kind:      metav1.GroupVersionKind{Group: k8sapi.GroupVersion.Group, Version: k8sapi.GroupVersion.Version, Kind: "PipelineVersion"},
+			Resource:  metav1.GroupVersionResource{Group: k8sapi.GroupVersion.Group, Version: k8sapi.GroupVersion.Version, Resource: "pipelineversions"},
+			Namespace: pipelineVersion.Namespace,
+			Operation: admissionv1.Create,
+			Object:    runtime.RawExtension{Raw: rawObject},
+		},
+	}
+	body, err := json.Marshal(review)
+	require.NoError(t, err)
+
+	request := httptest.NewRequest(http.MethodPost, "/webhooks", bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	require.Equal(t, http.StatusOK, recorder.Code)
+
+	var response admissionv1.AdmissionReview
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &response))
+	require.NotNil(t, response.Response)
+	return response.Response
+}
+
+func TestPipelineVersionWebhook_AdmissionHandlers_StatusCodes(t *testing.T) {
+	setPipelineVersionObjectSizeConfig(t, nil)
+	pipelineWebhook, validPipelineSpecJSON := setupPipelineWebhookTest(t)
+	validating, mutating, err := NewPipelineVersionWebhook(pipelineWebhook.Client, pipelineWebhook.Client)
+	require.NoError(t, err)
+
+	response := sendAdmissionReview(t, validating, newPipelineVersionWithAnnotation(validPipelineSpecJSON, 0))
+	assert.True(t, response.Allowed, "a valid PipelineVersion is admitted")
+
+	response = sendAdmissionReview(t, validating, newPipelineVersionWithAnnotation(validPipelineSpecJSON, common.DefaultPipelineVersionObjectBytes))
+	require.False(t, response.Allowed)
+	assert.Equal(t, int32(http.StatusBadRequest), response.Result.Code)
+	assert.Contains(t, response.Result.Message, "too large to store in Kubernetes")
+	require.NotNil(t, response.Result.Details, "the denial carries the cause the KFP API uses to report invalid input")
+	require.Len(t, response.Result.Details.Causes, 1)
+	assert.Equal(t, k8sapi.PipelineVersionRejectedCause, response.Result.Details.Causes[0].Type)
+	assert.Equal(t, response.Result.Message, response.Result.Details.Causes[0].Message)
+
+	setPipelineVersionObjectSizeConfig(t, []interface{}{1024})
+	response = sendAdmissionReview(t, validating, newPipelineVersionWithAnnotation(validPipelineSpecJSON, 0))
+	require.False(t, response.Allowed)
+	assert.Equal(t, int32(http.StatusInternalServerError), response.Result.Code)
+	assert.Contains(t, response.Result.Message, "misconfigured")
+	assert.False(t, hasRejectedCause(response.Result), "server-side failures must not be reported as invalid input")
+
+	failingWebhook := newPipelineWebhookWithPipelineLookupError(t, apierrors.NewServiceUnavailable("Kubernetes API temporarily unavailable"))
+	_, failingMutating, err := NewPipelineVersionWebhook(failingWebhook.Client, failingWebhook.ClientNoCache)
+	require.NoError(t, err)
+	response = sendAdmissionReview(t, failingMutating, newPipelineVersionWithAnnotation(validPipelineSpecJSON, 0))
+	require.False(t, response.Allowed)
+	assert.Equal(t, int32(http.StatusInternalServerError), response.Result.Code)
+	assert.False(t, hasRejectedCause(response.Result), "server-side failures must not be reported as invalid input")
+
+	response = sendAdmissionReview(t, mutating, newPipelineVersionWithAnnotation(validPipelineSpecJSON, 0))
+	assert.True(t, response.Allowed, "the mutating webhook admits a PipelineVersion whose Pipeline exists")
+}
+
+func hasRejectedCause(status *metav1.Status) bool {
+	return apierrors.HasStatusCause(&apierrors.StatusError{ErrStatus: *status}, k8sapi.PipelineVersionRejectedCause)
 }

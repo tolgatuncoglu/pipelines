@@ -225,10 +225,31 @@ func (k *PipelineStoreKubernetes) CreatePipelineAndPipelineVersion(pipeline *mod
 
 	pipelineVersion, err = k.createPipelineVersionWithPipeline(context.TODO(), pipeline, pipelineVersion)
 	if err != nil {
+		// Without this, a rejected version (for example one over the size limit) leaves an empty Pipeline
+		// behind and the user's corrected retry fails because the pipeline name already exists.
+		k.deleteOrphanedPipeline(pipeline)
 		return nil, nil, err
 	}
 
 	return pipeline, pipelineVersion, nil
+}
+
+// deleteOrphanedPipeline best-effort deletes a Pipeline whose first version could not be created. The UID
+// precondition ensures only the Pipeline created by this request is deleted. Failures are logged rather
+// than returned so the caller still sees why the version was rejected.
+func (k *PipelineStoreKubernetes) deleteOrphanedPipeline(pipeline *model.Pipeline) {
+	k8sPipeline := v2beta1.FromPipelineModel(*pipeline)
+	var opts []ctrlclient.DeleteOption
+	if k8sPipeline.UID != "" {
+		uid := k8sPipeline.UID
+		opts = append(opts, ctrlclient.Preconditions{UID: &uid})
+	}
+
+	err := k.client.Delete(context.TODO(), &k8sPipeline, opts...)
+	if err != nil && !k8serrors.IsNotFound(err) {
+		glog.Errorf("Failed to delete the pipeline %s/%s after its first pipeline version could not be created: %v",
+			k8sPipeline.Namespace, k8sPipeline.Name, err)
+	}
 }
 
 func (k *PipelineStoreKubernetes) CreatePipeline(pipeline *model.Pipeline) (*model.Pipeline, error) {
@@ -864,11 +885,31 @@ func (k *PipelineStoreKubernetes) createPipelineVersionWithPipeline(ctx context.
 		)
 	} else if k8serrors.IsInvalid(err) && strings.Contains(err.Error(), "metadata.name") {
 		return nil, util.NewBadKubernetesNameError("pipeline version")
+	} else if cause, ok := k8serrors.StatusCause(err, v2beta1.PipelineVersionRejectedCause); ok {
+		// The KFP webhook rejected the submitted object. The cause carries its user-facing message without
+		// the API server's "admission webhook ... denied the request" prefix, and the error adds nothing else.
+		return nil, util.NewInvalidInputError("%s", cause.Message)
+	} else if isKubernetesObjectTooLargeError(err) {
+		// The Kubernetes error is kept once, as the cause, for operators.
+		return nil, util.NewInvalidInputErrorWithDetails(err, common.PipelineVersionRejectedByKubernetesMessage())
 	} else if err != nil {
 		return nil, util.NewInternalServerError(err, "Failed to create the pipeline version")
 	}
 
 	return k8sPipelineVersion.ToModel()
+}
+
+// isKubernetesObjectTooLargeError reports whether Kubernetes rejected an object because of its size:
+// etcd's --max-request-bytes, the API server's 2 MiB etcd client send limit (both after admission),
+// or the API server's 3 MiB request body limit (HTTP 413, before admission).
+func isKubernetesObjectTooLargeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return k8serrors.IsRequestEntityTooLargeError(err) ||
+		strings.Contains(message, "etcdserver: request is too large") ||
+		strings.Contains(message, "trying to send message larger than max")
 }
 
 func (k *PipelineStoreKubernetes) UpdatePipelineFields(pipelineID string, displayName string, tags map[string]string) error {
