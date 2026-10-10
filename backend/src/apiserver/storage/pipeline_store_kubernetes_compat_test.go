@@ -973,3 +973,67 @@ func TestCreatePipelineAndPipelineVersion_KeepsPipelineWhenOutcomeIsUnknown(t *t
 	assert.Equal(t, 1, pipelines)
 	assert.Equal(t, 1, versions)
 }
+
+func TestUpdatePipelineVersionFields_MapsKubernetesUpdateErrors(t *testing.T) {
+	podNamespace := viper.Get("POD_NAMESPACE")
+	viper.Set("POD_NAMESPACE", "Test")
+	defer viper.Set("POD_NAMESPACE", podNamespace)
+
+	const webhookMessage = "This update would make the pipeline version too large to store in Kubernetes"
+	testCases := []struct {
+		name            string
+		updateError     error
+		expectedCode    codes.Code
+		expectedMessage string
+	}{
+		{
+			name: "KFP webhook rejects the update",
+			updateError: webhookDenial(metav1.Status{Status: metav1.StatusFailure, Code: 400, Reason: metav1.StatusReasonBadRequest,
+				Message: webhookMessage,
+				Details: &metav1.StatusDetails{Causes: []metav1.StatusCause{{Type: v2beta1.PipelineVersionRejectedCause, Message: webhookMessage}}}}),
+			expectedCode:    codes.InvalidArgument,
+			expectedMessage: webhookMessage,
+		},
+		{
+			name:            "etcd request too large",
+			updateError:     &k8serrors.StatusError{ErrStatus: metav1.Status{Status: metav1.StatusFailure, Code: 500, Message: "etcdserver: request is too large"}},
+			expectedCode:    codes.InvalidArgument,
+			expectedMessage: common.PipelineVersionUpdateRejectedByKubernetesMessage(),
+		},
+		{
+			name:            "unexpected error",
+			updateError:     k8serrors.NewInternalError(fmt.Errorf("simulated failure")),
+			expectedCode:    codes.Internal,
+			expectedMessage: "Internal Server Error",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			require.NoError(t, v2beta1.AddToScheme(scheme))
+			version := &v2beta1.PipelineVersion{
+				ObjectMeta: metav1.ObjectMeta{UID: DefaultFakePipelineIdTwo, Name: "my-pipeline-v1", Namespace: "Test"},
+				Spec:       v2beta1.PipelineVersionSpec{PipelineName: "my-pipeline", DisplayName: "v1"},
+			}
+			k8sClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(version).
+				WithInterceptorFuncs(interceptor.Funcs{
+					Update: func(context.Context, client.WithWatch, client.Object, ...client.UpdateOption) error {
+						return testCase.updateError
+					},
+				}).
+				Build()
+			store := NewPipelineStoreKubernetes(k8sClient, k8sClient)
+
+			err := store.UpdatePipelineVersionFields(DefaultFakePipelineIdTwo, strings.Repeat("n", 16<<10), nil)
+			require.Error(t, err)
+			var userError *util.UserError
+			require.True(t, errors.As(err, &userError))
+			assert.Equal(t, testCase.expectedCode, userError.ExternalStatusCode())
+			assert.Contains(t, userError.ExternalMessage(), testCase.expectedMessage)
+			assert.NotContains(t, userError.ExternalMessage(), "admission webhook")
+		})
+	}
+}

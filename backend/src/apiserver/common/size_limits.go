@@ -170,10 +170,13 @@ func NewSizeLimitError(control string, limit int64, setting string) error {
 	return util.NewInvalidInputErrorWithDetails(err, err.Error())
 }
 
-const pipelineVersionTooLargeRemedy = "To fix this, make the compiled pipeline smaller, for example by moving embedded files, " +
-	"notebooks, or large inline Python code into a container image or object storage."
+const (
+	pipelineVersionTooLargeRemedy = "To fix this, make the compiled pipeline smaller, for example by moving embedded files, " +
+		"notebooks, or large inline Python code into a container image or object storage."
+	pipelineVersionUpdateTooLargeRemedy = "To fix this, use a shorter display name, or fewer or shorter tags, labels, or annotations."
+)
 
-// PipelineVersionObjectTooLargeMessage explains a PipelineVersion rejected by the KFP size limit. It is
+// PipelineVersionObjectTooLargeMessage explains a new PipelineVersion rejected by the KFP size limit. It is
 // shown to API and kubectl users, so it says what happened, why, and what each audience can do.
 func PipelineVersionObjectTooLargeMessage(objectBytes int, limit int) string {
 	return fmt.Sprintf("The pipeline version is too large to store in Kubernetes: the PipelineVersion object is %d bytes (%.2f MiB) "+
@@ -184,11 +187,28 @@ func PipelineVersionObjectTooLargeMessage(objectBytes int, limit int) string {
 		MaxPipelineSpecBytesEnv, pipelineVersionTooLargeRemedy, MaxPipelineVersionObjectBytesConfig)
 }
 
-// PipelineVersionRejectedByKubernetesMessage explains a PipelineVersion that passed the KFP size check
-// but was rejected by a Kubernetes size limit, whose error reports neither the object size nor the limit.
+// PipelineVersionUpdateTooLargeMessage explains an update rejected because it grows a PipelineVersion past the
+// KFP size limit. Only the fields an update can change are offered as the remedy.
+func PipelineVersionUpdateTooLargeMessage(objectBytes int, previousBytes int, limit int) string {
+	return fmt.Sprintf("This update would make the pipeline version too large to store in Kubernetes: the PipelineVersion object "+
+		"would grow from %d bytes to %d bytes (%.2f MiB), and the limit is %d bytes (%.2f MiB). "+
+		"Kubernetes stores each pipeline version as a single etcd object. %s",
+		previousBytes, objectBytes, float64(objectBytes)/(1<<20), limit, float64(limit)/(1<<20),
+		pipelineVersionUpdateTooLargeRemedy)
+}
+
+// PipelineVersionRejectedByKubernetesMessage explains a new PipelineVersion that passed the KFP size check but
+// was rejected by a Kubernetes size limit, whose error reports neither the object size nor the limit.
 func PipelineVersionRejectedByKubernetesMessage() string {
 	return fmt.Sprintf("The pipeline version is too large to store in Kubernetes. "+
 		"Kubernetes stores each pipeline version as a single etcd object, which is limited to 1.5 MiB by default "+
 		"regardless of %s. %s Alternatively, use the database pipeline store.",
 		MaxPipelineSpecBytesEnv, pipelineVersionTooLargeRemedy)
+}
+
+// PipelineVersionUpdateRejectedByKubernetesMessage explains an update that a Kubernetes size limit rejected.
+func PipelineVersionUpdateRejectedByKubernetesMessage() string {
+	return "This update would make the pipeline version too large to store in Kubernetes. " +
+		"Kubernetes stores each pipeline version as a single etcd object, which is limited to 1.5 MiB by default. " +
+		pipelineVersionUpdateTooLargeRemedy
 }

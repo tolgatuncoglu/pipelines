@@ -102,7 +102,7 @@ func (p *PipelineVersionsWebhook) ValidateCreate(
 
 	// Check the size first so an oversized object fails with an actionable message here instead of
 	// a generic "request is too large" error from etcd after admission.
-	if err := validatePipelineVersionObjectSize(pipelineVersion); err != nil {
+	if err := validatePipelineVersionObjectSize(pipelineVersion, nil); err != nil {
 		return nil, err
 	}
 
@@ -125,27 +125,74 @@ func (p *PipelineVersionsWebhook) ValidateCreate(
 	return nil, nil
 }
 
-// validatePipelineVersionObjectSize reads the limit on every call so configuration changes apply
-// without restarting the API server.
-func validatePipelineVersionObjectSize(pipelineVersion *k8sapi.PipelineVersion) error {
+// validatePipelineVersionObjectSize rejects a PipelineVersion whose serialized size exceeds the limit. For an
+// update, previous is the stored object, and the update is rejected only if it also grows the object, so
+// versions already over the limit, for example after an administrator lowered it, stay editable. The limit
+// is read on every call so configuration changes apply without restarting the API server.
+func validatePipelineVersionObjectSize(pipelineVersion *k8sapi.PipelineVersion, previous *k8sapi.PipelineVersion) error {
 	limit, err := common.GetPipelineVersionObjectSizeLimit()
 	if err != nil {
 		return apierrors.NewInternalError(fmt.Errorf("the PipelineVersion object size limit is misconfigured: %w. Ask an administrator to fix it", err))
 	}
 
-	// Measure the whole object Kubernetes persists, including metadata such as the
-	// kubectl.kubernetes.io/last-applied-configuration annotation.
-	serialized, err := json.Marshal(pipelineVersion)
-	if err != nil {
-		return apierrors.NewInternalError(fmt.Errorf("failed to serialize the PipelineVersion object: %w", err))
+	size, err := serializedSize(pipelineVersion)
+	if err != nil || size <= limit {
+		return err
 	}
-	if len(serialized) <= limit {
-		return nil
+	if previous == nil {
+		logSizeLimitExceeded(limit, size)
+		return newBadRequestError(common.PipelineVersionObjectTooLargeMessage(size, limit))
 	}
 
+	// Compare only what the request controls. Kubernetes bumps the generation and rewrites managed fields
+	// on updates, which would otherwise make an update that shrinks the object look like growth.
+	grows, err := growsUserContent(pipelineVersion, previous)
+	if err != nil || !grows {
+		return err
+	}
+	previousSize, err := serializedSize(previous)
+	if err != nil {
+		return err
+	}
+	logSizeLimitExceeded(limit, size)
+	return newBadRequestError(common.PipelineVersionUpdateTooLargeMessage(size, previousSize, limit))
+}
+
+// growsUserContent reports whether an update makes the object larger, ignoring metadata that the
+// Kubernetes API server maintains.
+func growsUserContent(pipelineVersion *k8sapi.PipelineVersion, previous *k8sapi.PipelineVersion) (bool, error) {
+	size, err := serializedSize(withoutServerManagedMetadata(pipelineVersion))
+	if err != nil {
+		return false, err
+	}
+	previousSize, err := serializedSize(withoutServerManagedMetadata(previous))
+	if err != nil {
+		return false, err
+	}
+	return size > previousSize, nil
+}
+
+func withoutServerManagedMetadata(pipelineVersion *k8sapi.PipelineVersion) *k8sapi.PipelineVersion {
+	stripped := pipelineVersion.DeepCopy()
+	stripped.ManagedFields = nil
+	stripped.Generation = 0
+	stripped.ResourceVersion = ""
+	return stripped
+}
+
+// serializedSize measures the whole object Kubernetes persists, including metadata such as the
+// kubectl.kubernetes.io/last-applied-configuration annotation.
+func serializedSize(pipelineVersion *k8sapi.PipelineVersion) (int, error) {
+	serialized, err := json.Marshal(pipelineVersion)
+	if err != nil {
+		return 0, apierrors.NewInternalError(fmt.Errorf("failed to serialize the PipelineVersion object: %w", err))
+	}
+	return len(serialized), nil
+}
+
+func logSizeLimitExceeded(limit int, size int) {
 	glog.Warningf("size_limit_exceeded control=pipeline_version_object limit_bytes=%d object_bytes=%d setting=%s",
-		limit, len(serialized), common.MaxPipelineVersionObjectBytesConfig)
-	return newBadRequestError(common.PipelineVersionObjectTooLargeMessage(len(serialized), limit))
+		limit, size, common.MaxPipelineVersionObjectBytesConfig)
 }
 
 func (p *PipelineVersionsWebhook) ValidateUpdate(_ context.Context, oldObj, newObj runtime.Object) (ctrladmission.Warnings, error) {
@@ -172,6 +219,12 @@ func (p *PipelineVersionsWebhook) ValidateUpdate(_ context.Context, oldObj, newO
 		if !reflect.DeepEqual(*expected, newPipelineVersion.Spec) {
 			return nil, newBadRequestError("Pipeline spec is immutable; only mutable fields (display_name, tags) can be updated")
 		}
+	}
+
+	// Check every update, not only spec changes: labels and annotations can grow the object without
+	// changing its generation.
+	if err := validatePipelineVersionObjectSize(newPipelineVersion, oldPipelineVersion); err != nil {
+		return nil, err
 	}
 
 	return nil, nil

@@ -109,6 +109,19 @@ func TestPipelineVersionObjectTooLargeMessage(t *testing.T) {
 	}
 }
 
+func TestPipelineVersionUpdateTooLargeMessage(t *testing.T) {
+	message := PipelineVersionUpdateTooLargeMessage(1600000, 1500000, DefaultPipelineVersionObjectBytes)
+	for _, expected := range []string{
+		"This update would make the pipeline version too large to store in Kubernetes",
+		"would grow from 1500000 bytes to 1600000 bytes (1.53 MiB)",
+		"the limit is 1556480 bytes (1.48 MiB)",
+		"shorter display name",
+	} {
+		require.Contains(t, message, expected)
+	}
+	require.NotContains(t, message, "compiled pipeline", "an update cannot change the pipeline spec")
+}
+
 func TestPipelineVersionObjectSizeLimit_AcceptsValuesUpToKubernetesLimit(t *testing.T) {
 	for _, value := range []interface{}{"1", "2080768", 2080768, strconv.Itoa(MaximumPipelineVersionObjectBytes)} {
 		setPipelineVersionObjectSizeConfig(t, value)

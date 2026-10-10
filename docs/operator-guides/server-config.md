@@ -449,12 +449,15 @@ large for the Kubernetes pipeline store. Without the KFP check, Kubernetes rejec
 
 The `PipelineVersion` validating webhook measures the serialized object and rejects objects larger than
 `MAX_PIPELINE_VERSION_OBJECT_BYTES` with a message that reports the object size and the limit. Pipeline
-versions created through the KFP API that are rejected for their size by the webhook or by Kubernetes
-return `InvalidArgument` instead of an internal error. This setting has no effect when the database
-pipeline store is used. The webhook checks size only when a `PipelineVersion` is created. The
-pipeline spec cannot change after creation, so updates through the KFP API cannot grow the object
-past the limit. An update that adds large labels or annotations, for example with `kubectl`, is
-still bounded by Kubernetes and fails with the Kubernetes error.
+versions created or updated through the KFP API that are rejected for their size by the webhook or by
+Kubernetes return `InvalidArgument` instead of an internal error. This setting has no effect when the
+database pipeline store is used.
+
+The webhook also checks updates, such as a new display name or tags set through the KFP API, or
+labels and annotations edited with `kubectl`. It rejects an update only if the object is over the
+limit and the update makes it larger, ignoring metadata that Kubernetes maintains itself, such as
+managed fields. Pipeline versions that are already over the limit, for example after the limit was
+lowered, can still be edited as long as an edit does not grow them. Status updates are not checked.
 
 | Setting | What it bounds | Default | Supported range |
 | --- | --- | --- | --- |

@@ -541,3 +541,61 @@ func TestPipelineVersionWebhook_AdmissionHandlers_StatusCodes(t *testing.T) {
 func hasRejectedCause(status *metav1.Status) bool {
 	return apierrors.HasStatusCause(&apierrors.StatusError{ErrStatus: *status}, k8sapi.PipelineVersionRejectedCause)
 }
+
+func TestPipelineVersionWebhook_ValidateUpdate_ObjectSize(t *testing.T) {
+	pipelineWebhook, validPipelineSpecJSON := setupPipelineWebhookTest(t)
+
+	// Updates bump server-managed metadata the way the Kubernetes API server does, so a shrinking update is
+	// still recognized as one.
+	withDisplayName := func(version *k8sapi.PipelineVersion, displayName string) *k8sapi.PipelineVersion {
+		updated := version.DeepCopy()
+		updated.Generation = 10
+		updated.ResourceVersion = "123456"
+		updated.ManagedFields = append(updated.ManagedFields, metav1.ManagedFieldsEntry{Manager: "ml-pipeline", Operation: metav1.ManagedFieldsOperationUpdate})
+		updated.Spec.DisplayName = displayName
+		return updated
+	}
+	withLabel := func(version *k8sapi.PipelineVersion, value string) *k8sapi.PipelineVersion {
+		updated := version.DeepCopy()
+		updated.ResourceVersion = "123456"
+		updated.ManagedFields = append(updated.ManagedFields, metav1.ManagedFieldsEntry{Manager: "kubectl-edit", Operation: metav1.ManagedFieldsOperationUpdate})
+		updated.Labels = map[string]string{"team": value}
+		return updated
+	}
+	small := newPipelineVersionWithAnnotation(validPipelineSpecJSON, 0)
+	small.Labels = map[string]string{"team": "a"}
+	// Already over the 8 KiB limit used below, as after an administrator lowered it.
+	oversized := newPipelineVersionWithAnnotation(validPipelineSpecJSON, 16<<10)
+	oversized.Labels = map[string]string{"team": "a"}
+	oversized.Spec.DisplayName = "long display name"
+	oversized.Generation = 9
+	oversized.ResourceVersion = "99"
+
+	testCases := []struct {
+		name     string
+		old      *k8sapi.PipelineVersion
+		new      *k8sapi.PipelineVersion
+		rejected bool
+	}{
+		{name: "update within the limit", old: small, new: withDisplayName(small, "renamed")},
+		{name: "display name grows past the limit", old: small, new: withDisplayName(small, strings.Repeat("n", 16<<10)), rejected: true},
+		{name: "oversized version shrinks", old: oversized, new: withDisplayName(oversized, "short")},
+		{name: "oversized version keeps its size", old: oversized, new: withLabel(oversized, "b")},
+		{name: "oversized version grows through metadata only", old: oversized, new: withLabel(oversized, "a much longer team name"), rejected: true},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			setPipelineVersionObjectSizeConfig(t, "8192")
+			_, err := pipelineWebhook.ValidateUpdate(context.TODO(), testCase.old, testCase.new)
+			if !testCase.rejected {
+				assert.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.True(t, apierrors.IsBadRequest(err))
+			assert.True(t, apierrors.HasStatusCause(err, k8sapi.PipelineVersionRejectedCause), "the KFP API reports the rejection as invalid input")
+			assert.Contains(t, err.Error(), "This update would make the pipeline version too large to store in Kubernetes")
+			assert.Contains(t, err.Error(), "the limit is 8192 bytes")
+		})
+	}
+}

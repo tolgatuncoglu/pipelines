@@ -897,13 +897,8 @@ func (k *PipelineStoreKubernetes) createPipelineVersionWithPipeline(ctx context.
 		)
 	} else if k8serrors.IsInvalid(err) && strings.Contains(err.Error(), "metadata.name") {
 		return nil, true, util.NewBadKubernetesNameError("pipeline version")
-	} else if cause, ok := k8serrors.StatusCause(err, v2beta1.PipelineVersionRejectedCause); ok {
-		// The KFP webhook rejected the submitted object. The cause carries its user-facing message without
-		// the API server's "admission webhook ... denied the request" prefix, and the error adds nothing else.
-		return nil, true, util.NewInvalidInputError("%s", cause.Message)
-	} else if isKubernetesObjectTooLargeError(err) {
-		// The Kubernetes error is kept once, as the cause, for operators.
-		return nil, true, util.NewInvalidInputErrorWithDetails(err, common.PipelineVersionRejectedByKubernetesMessage())
+	} else if refusal := pipelineVersionRefusal(err, common.PipelineVersionRejectedByKubernetesMessage()); refusal != nil {
+		return nil, true, refusal
 	} else if err != nil {
 		// The outcome is unknown: the request may have failed after Kubernetes stored the version.
 		return nil, false, util.NewInternalServerError(err, "Failed to create the pipeline version")
@@ -911,6 +906,20 @@ func (k *PipelineStoreKubernetes) createPipelineVersionWithPipeline(ctx context.
 
 	version, err := k8sPipelineVersion.ToModel()
 	return version, false, err
+}
+
+// pipelineVersionRefusal converts a refused PipelineVersion write into an InvalidArgument error, or returns nil
+// if err is not a refusal. A refusal is a rejection by the KFP webhook, whose cause carries its user-facing
+// message without the API server's "admission webhook ... denied the request" prefix, or a Kubernetes size
+// limit, explained by sizeMessage with the Kubernetes error kept once as the cause for operators.
+func pipelineVersionRefusal(err error, sizeMessage string) error {
+	if cause, ok := k8serrors.StatusCause(err, v2beta1.PipelineVersionRejectedCause); ok {
+		return util.NewInvalidInputError("%s", cause.Message)
+	}
+	if isKubernetesObjectTooLargeError(err) {
+		return util.NewInvalidInputErrorWithDetails(err, sizeMessage)
+	}
+	return nil
 }
 
 // isKubernetesObjectTooLargeError reports whether Kubernetes rejected an object because of its size:
@@ -959,6 +968,9 @@ func (k *PipelineStoreKubernetes) UpdatePipelineVersionFields(pipelineVersionID 
 		versionCopy.Spec.Tags = tags
 	}
 	if err := k.client.Update(context.TODO(), versionCopy); err != nil {
+		if refusal := pipelineVersionRefusal(err, common.PipelineVersionUpdateRejectedByKubernetesMessage()); refusal != nil {
+			return refusal
+		}
 		return util.NewInternalServerError(err, "Failed to update pipeline version %v", pipelineVersionID)
 	}
 	return k.updateWithTimeout(versionCopy)
