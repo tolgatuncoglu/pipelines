@@ -35,6 +35,7 @@ import (
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -853,39 +854,122 @@ func TestCreatePipelineVersion_MapsKubernetesCreateErrors(t *testing.T) {
 	}
 }
 
-func TestCreatePipelineAndPipelineVersion_DeletesPipelineWhenVersionIsRejected(t *testing.T) {
+// pipelineCleanupHarness is a fake Kubernetes client whose first PipelineVersion create runs onVersionCreate
+// in place of the real create, and which records the options of every Pipeline delete.
+type pipelineCleanupHarness struct {
+	client          client.WithWatch
+	store           *PipelineStoreKubernetes
+	pipelineDeletes []*client.DeleteOptions
+}
+
+func newPipelineCleanupHarness(t *testing.T, onVersionCreate func(ctx context.Context, c client.WithWatch, version *v2beta1.PipelineVersion) error) *pipelineCleanupHarness {
+	t.Helper()
 	scheme := runtime.NewScheme()
 	require.NoError(t, v2beta1.AddToScheme(scheme))
 
-	rejectVersions := true
-	k8sClient := fake.NewClientBuilder().
+	harness := &pipelineCleanupHarness{}
+	intercepted := false
+	harness.client = fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithInterceptorFuncs(interceptor.Funcs{
-			Create: func(ctx context.Context, client client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
-				if _, ok := obj.(*v2beta1.PipelineVersion); ok && rejectVersions {
-					return k8serrors.NewBadRequest("admission webhook denied the request: The pipeline version is too large to store in Kubernetes")
+			Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				if pipeline, ok := obj.(*v2beta1.Pipeline); ok && pipeline.UID == "" {
+					// The fake client does not assign UIDs; Kubernetes always does.
+					pipeline.UID = types.UID(fmt.Sprintf("uid-%s", pipeline.Name))
 				}
-				return client.Create(ctx, obj, opts...)
+				if version, ok := obj.(*v2beta1.PipelineVersion); ok && !intercepted {
+					intercepted = true
+					return onVersionCreate(ctx, c, version)
+				}
+				return c.Create(ctx, obj, opts...)
+			},
+			Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+				if _, ok := obj.(*v2beta1.Pipeline); ok {
+					deleteOptions := &client.DeleteOptions{}
+					deleteOptions.ApplyOptions(opts)
+					harness.pipelineDeletes = append(harness.pipelineDeletes, deleteOptions)
+				}
+				return c.Delete(ctx, obj, opts...)
 			},
 		}).
 		Build()
-	store := NewPipelineStoreKubernetes(k8sClient, k8sClient)
+	harness.store = NewPipelineStoreKubernetes(harness.client, harness.client)
+	return harness
+}
 
-	newRequest := func() (*model.Pipeline, *model.PipelineVersion) {
-		return &model.Pipeline{Name: "large-pipeline", Namespace: "Test"},
-			&model.PipelineVersion{Name: "large-pipeline", PipelineSpec: model.LargeText(getBasicPipelineSpecYAML())}
-	}
+func newLargePipelineRequest() (*model.Pipeline, *model.PipelineVersion) {
+	return &model.Pipeline{Name: "large-pipeline", Namespace: "Test"},
+		&model.PipelineVersion{Name: "large-pipeline", PipelineSpec: model.LargeText(getBasicPipelineSpecYAML())}
+}
 
-	_, _, err := store.CreatePipelineAndPipelineVersion(newRequest())
+func (h *pipelineCleanupHarness) objectCounts(t *testing.T) (pipelines int, versions int) {
+	t.Helper()
+	pipelineList := &v2beta1.PipelineList{}
+	require.NoError(t, h.client.List(context.TODO(), pipelineList))
+	versionList := &v2beta1.PipelineVersionList{}
+	require.NoError(t, h.client.List(context.TODO(), versionList))
+	return len(pipelineList.Items), len(versionList.Items)
+}
+
+func TestCreatePipelineAndPipelineVersion_DeletesPipelineWhenVersionIsRefused(t *testing.T) {
+	harness := newPipelineCleanupHarness(t, func(context.Context, client.WithWatch, *v2beta1.PipelineVersion) error {
+		return webhookDenial(metav1.Status{Status: metav1.StatusFailure, Code: 400, Reason: metav1.StatusReasonBadRequest,
+			Message: "The pipeline version is too large to store in Kubernetes",
+			Details: &metav1.StatusDetails{Causes: []metav1.StatusCause{{
+				Type: v2beta1.PipelineVersionRejectedCause, Message: "The pipeline version is too large to store in Kubernetes"}}}})
+	})
+
+	_, _, err := harness.store.CreatePipelineAndPipelineVersion(newLargePipelineRequest())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "too large to store in Kubernetes", "the version error is returned, not a cleanup error")
 
-	pipelines := &v2beta1.PipelineList{}
-	require.NoError(t, k8sClient.List(context.TODO(), pipelines))
-	assert.Empty(t, pipelines.Items, "the Pipeline created for the rejected version is deleted")
+	pipelines, _ := harness.objectCounts(t)
+	assert.Zero(t, pipelines, "the Pipeline created for the refused version is deleted")
+	require.Len(t, harness.pipelineDeletes, 1)
+	require.NotNil(t, harness.pipelineDeletes[0].PropagationPolicy)
+	assert.Equal(t, metav1.DeletePropagationOrphan, *harness.pipelineDeletes[0].PropagationPolicy,
+		"the cleanup must never garbage-collect pipeline versions")
+	require.NotNil(t, harness.pipelineDeletes[0].Preconditions)
+	assert.NotNil(t, harness.pipelineDeletes[0].Preconditions.UID, "only the Pipeline created by this request is deleted")
 
 	// The user fixes the pipeline and retries with the same name.
-	rejectVersions = false
-	_, _, err = store.CreatePipelineAndPipelineVersion(newRequest())
+	_, _, err = harness.store.CreatePipelineAndPipelineVersion(newLargePipelineRequest())
 	require.NoError(t, err)
+}
+
+func TestCreatePipelineAndPipelineVersion_KeepsVersionAttachedConcurrently(t *testing.T) {
+	// Another client attaches a valid version to the new Pipeline before this request's version is refused.
+	harness := newPipelineCleanupHarness(t, func(ctx context.Context, c client.WithWatch, version *v2beta1.PipelineVersion) error {
+		concurrent := version.DeepCopy()
+		concurrent.Name = "large-pipeline-concurrent"
+		require.NoError(t, c.Create(ctx, concurrent))
+		return k8serrors.NewRequestEntityTooLargeError("limit is 3145728")
+	})
+
+	_, _, err := harness.store.CreatePipelineAndPipelineVersion(newLargePipelineRequest())
+	require.Error(t, err)
+
+	// The fake client does not garbage-collect, so the guarantee is the propagation policy: Kubernetes keeps
+	// dependents of a Pipeline deleted with orphan propagation.
+	require.Len(t, harness.pipelineDeletes, 1)
+	require.NotNil(t, harness.pipelineDeletes[0].PropagationPolicy)
+	assert.Equal(t, metav1.DeletePropagationOrphan, *harness.pipelineDeletes[0].PropagationPolicy)
+	_, versions := harness.objectCounts(t)
+	assert.Equal(t, 1, versions, "the concurrently attached version remains")
+}
+
+func TestCreatePipelineAndPipelineVersion_KeepsPipelineWhenOutcomeIsUnknown(t *testing.T) {
+	// Kubernetes stores the version, but the response is lost.
+	harness := newPipelineCleanupHarness(t, func(ctx context.Context, c client.WithWatch, version *v2beta1.PipelineVersion) error {
+		require.NoError(t, c.Create(ctx, version))
+		return fmt.Errorf("http2: client connection lost")
+	})
+
+	_, _, err := harness.store.CreatePipelineAndPipelineVersion(newLargePipelineRequest())
+	require.Error(t, err)
+
+	assert.Empty(t, harness.pipelineDeletes, "a failure that may follow a successful write never triggers cleanup")
+	pipelines, versions := harness.objectCounts(t)
+	assert.Equal(t, 1, pipelines)
+	assert.Equal(t, 1, versions)
 }

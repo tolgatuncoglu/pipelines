@@ -223,31 +223,38 @@ func (k *PipelineStoreKubernetes) CreatePipelineAndPipelineVersion(pipeline *mod
 		return nil, nil, err
 	}
 
-	pipelineVersion, err = k.createPipelineVersionWithPipeline(context.TODO(), pipeline, pipelineVersion)
+	pipelineVersion, refused, err := k.createPipelineVersionWithPipeline(context.TODO(), pipeline, pipelineVersion)
 	if err != nil {
-		// Without this, a rejected version (for example one over the size limit) leaves an empty Pipeline
-		// behind and the user's corrected retry fails because the pipeline name already exists.
-		k.deleteOrphanedPipeline(pipeline)
+		// Without this, a refused version (for example one over the size limit) leaves an empty Pipeline
+		// behind and the user's corrected retry fails because the pipeline name already exists. When the
+		// outcome is unknown, the version may exist, so the Pipeline is kept.
+		if refused {
+			k.deletePipelineOfRefusedVersion(pipeline)
+		}
 		return nil, nil, err
 	}
 
 	return pipeline, pipelineVersion, nil
 }
 
-// deleteOrphanedPipeline best-effort deletes a Pipeline whose first version could not be created. The UID
-// precondition ensures only the Pipeline created by this request is deleted. Failures are logged rather
-// than returned so the caller still sees why the version was rejected.
-func (k *PipelineStoreKubernetes) deleteOrphanedPipeline(pipeline *model.Pipeline) {
+// deletePipelineOfRefusedVersion best-effort deletes a Pipeline created by this request after Kubernetes refused
+// its first version. The UID precondition limits the delete to that Pipeline. Orphan propagation keeps any
+// version another client attached to it in the meantime, so the cleanup never deletes a pipeline version.
+// Failures are logged rather than returned so the caller still sees why the version was refused.
+func (k *PipelineStoreKubernetes) deletePipelineOfRefusedVersion(pipeline *model.Pipeline) {
 	k8sPipeline := v2beta1.FromPipelineModel(*pipeline)
-	var opts []ctrlclient.DeleteOption
-	if k8sPipeline.UID != "" {
-		uid := k8sPipeline.UID
-		opts = append(opts, ctrlclient.Preconditions{UID: &uid})
+	if k8sPipeline.UID == "" {
+		// Kubernetes always assigns a UID. Without one the delete cannot be limited to this Pipeline.
+		glog.Errorf("Not deleting the pipeline %s/%s after its first pipeline version was refused: its UID is unknown",
+			k8sPipeline.Namespace, k8sPipeline.Name)
+		return
 	}
+	uid := k8sPipeline.UID
 
-	err := k.client.Delete(context.TODO(), &k8sPipeline, opts...)
+	err := k.client.Delete(context.TODO(), &k8sPipeline,
+		ctrlclient.Preconditions{UID: &uid}, ctrlclient.PropagationPolicy(metav1.DeletePropagationOrphan))
 	if err != nil && !k8serrors.IsNotFound(err) {
-		glog.Errorf("Failed to delete the pipeline %s/%s after its first pipeline version could not be created: %v",
+		glog.Errorf("Failed to delete the pipeline %s/%s after its first pipeline version was refused: %v",
 			k8sPipeline.Namespace, k8sPipeline.Name, err)
 	}
 }
@@ -352,7 +359,8 @@ func (k *PipelineStoreKubernetes) CreatePipelineVersion(pipelineVersion *model.P
 		return nil, err
 	}
 
-	return k.createPipelineVersionWithPipeline(context.TODO(), pipeline, pipelineVersion)
+	version, _, err := k.createPipelineVersionWithPipeline(context.TODO(), pipeline, pipelineVersion)
+	return version, err
 }
 
 // GetDefaultPipelineVersion returns spec.defaultVersionName when set, otherwise the newest version.
@@ -854,24 +862,28 @@ func (k *PipelineStoreKubernetes) getK8sPipelineVersion(ctx context.Context, pip
 	return &pipelineVersions.Items[0], nil
 }
 
-func (k *PipelineStoreKubernetes) createPipelineVersionWithPipeline(ctx context.Context, pipeline *model.Pipeline, pipelineVersion *model.PipelineVersion) (*model.PipelineVersion, error) {
+// createPipelineVersionWithPipeline creates a pipeline version for an existing pipeline. refused reports that
+// Kubernetes did not store the version because the request was refused: it failed validation before the
+// create call, or the API server rejected it. refused is false on success and on errors, such as timeouts,
+// after which the version may have been stored.
+func (k *PipelineStoreKubernetes) createPipelineVersionWithPipeline(ctx context.Context, pipeline *model.Pipeline, pipelineVersion *model.PipelineVersion) (_ *model.PipelineVersion, refused bool, _ error) {
 	k8sPipelineVersion, err := v2beta1.FromPipelineVersionModel(*pipeline, *pipelineVersion)
 	if err != nil {
 		var userError *util.UserError
 		if errors.As(err, &userError) {
-			return nil, err
+			return nil, true, err
 		}
-		return nil, util.NewBadRequestError(err, "Invalid pipeline spec")
+		return nil, true, util.NewBadRequestError(err, "Invalid pipeline spec")
 	}
 
 	// Check for logical name collision (covers legacy bare-name CRs and composite-name CRs)
 	if _, lookupErr := k.getPipelineVersionByNameInNamespace(pipeline.Namespace, pipeline.UUID, pipeline.Name, pipelineVersion.Name); lookupErr == nil {
-		return nil, util.NewAlreadyExistError(
+		return nil, true, util.NewAlreadyExistError(
 			"Failed to create a new pipeline version. The name %v already exists. Please specify a new name",
 			pipelineVersion.Name,
 		)
 	} else if !util.IsUserErrorCodeMatch(lookupErr, codes.NotFound) {
-		return nil, lookupErr
+		return nil, true, lookupErr
 	}
 
 	glog.Infof(
@@ -879,24 +891,26 @@ func (k *PipelineStoreKubernetes) createPipelineVersionWithPipeline(ctx context.
 	)
 	err = k.client.Create(ctx, k8sPipelineVersion)
 	if k8serrors.IsAlreadyExists(err) {
-		return nil, util.NewAlreadyExistError(
+		return nil, true, util.NewAlreadyExistError(
 			"Failed to create a new pipeline version. The name %v already exists (resource name: %v). Please specify a new name",
 			pipelineVersion.Name, k8sPipelineVersion.Name,
 		)
 	} else if k8serrors.IsInvalid(err) && strings.Contains(err.Error(), "metadata.name") {
-		return nil, util.NewBadKubernetesNameError("pipeline version")
+		return nil, true, util.NewBadKubernetesNameError("pipeline version")
 	} else if cause, ok := k8serrors.StatusCause(err, v2beta1.PipelineVersionRejectedCause); ok {
 		// The KFP webhook rejected the submitted object. The cause carries its user-facing message without
 		// the API server's "admission webhook ... denied the request" prefix, and the error adds nothing else.
-		return nil, util.NewInvalidInputError("%s", cause.Message)
+		return nil, true, util.NewInvalidInputError("%s", cause.Message)
 	} else if isKubernetesObjectTooLargeError(err) {
 		// The Kubernetes error is kept once, as the cause, for operators.
-		return nil, util.NewInvalidInputErrorWithDetails(err, common.PipelineVersionRejectedByKubernetesMessage())
+		return nil, true, util.NewInvalidInputErrorWithDetails(err, common.PipelineVersionRejectedByKubernetesMessage())
 	} else if err != nil {
-		return nil, util.NewInternalServerError(err, "Failed to create the pipeline version")
+		// The outcome is unknown: the request may have failed after Kubernetes stored the version.
+		return nil, false, util.NewInternalServerError(err, "Failed to create the pipeline version")
 	}
 
-	return k8sPipelineVersion.ToModel()
+	version, err := k8sPipelineVersion.ToModel()
+	return version, false, err
 }
 
 // isKubernetesObjectTooLargeError reports whether Kubernetes rejected an object because of its size:
