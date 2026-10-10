@@ -16,11 +16,14 @@ package common
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/golang/glog"
 	"github.com/kubeflow/pipelines/backend/src/common/util"
+	"github.com/spf13/viper"
 )
 
 const (
@@ -32,6 +35,20 @@ const (
 	MaxPipelineUpdateBodyBytesEnv = "MAX_PIPELINE_UPDATE_BODY_BYTES"
 	// MaximumPipelineSizeBytes bounds administrator overrides; requests remain buffered in memory.
 	MaximumPipelineSizeBytes = 128 << 20
+
+	// MaxPipelineVersionObjectBytesConfig limits serialized PipelineVersion objects in the Kubernetes
+	// pipeline store. It is read from the environment or config.json on every check.
+	MaxPipelineVersionObjectBytesConfig = "MAX_PIPELINE_VERSION_OBJECT_BYTES"
+	// PipelineVersionObjectOverheadBytes is reserved below each Kubernetes limit for what etcd counts
+	// beyond the serialized object: the storage key and the transaction framing. It is a generous bound;
+	// the real overhead is a few hundred bytes.
+	PipelineVersionObjectOverheadBytes = 16 << 10
+	// DefaultPipelineVersionObjectBytes is the etcd --max-request-bytes default (1.5 MiB) minus the reserved overhead.
+	DefaultPipelineVersionObjectBytes = 1572864 - PipelineVersionObjectOverheadBytes
+	// MaximumPipelineVersionObjectBytes is the send limit of the Kubernetes API server's etcd client (2 MiB) minus
+	// the reserved overhead. That send limit is not configurable, so larger objects cannot be stored even if
+	// etcd accepts more.
+	MaximumPipelineVersionObjectBytes = 2<<20 - PipelineVersionObjectOverheadBytes
 )
 
 // PipelineSizeLimits contains independent, finite pipeline byte ceilings.
@@ -64,6 +81,52 @@ func GetPipelineSizeLimits() (PipelineSizeLimits, error) {
 		*setting.value = int(value)
 	}
 	return limits, nil
+}
+
+// GetPipelineVersionObjectSizeLimit returns the largest serialized PipelineVersion object the
+// Kubernetes pipeline store accepts. Unset or empty settings use the etcd default.
+func GetPipelineVersionObjectSizeLimit() (int, error) {
+	invalidValueErr := fmt.Errorf("%s must be a positive integer number of bytes; unset it to use the %d-byte default",
+		MaxPipelineVersionObjectBytesConfig, DefaultPipelineVersionObjectBytes)
+
+	// viper.GetString silently turns unsupported types such as JSON arrays into "", so inspect the raw value.
+	var value int64
+	switch raw := viper.Get(MaxPipelineVersionObjectBytesConfig).(type) {
+	case nil:
+		return DefaultPipelineVersionObjectBytes, nil
+	case string:
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			return DefaultPipelineVersionObjectBytes, nil
+		}
+		parsed, err := strconv.ParseInt(trimmed, 10, 64)
+		if err != nil {
+			return 0, invalidValueErr
+		}
+		value = parsed
+	case int:
+		value = int64(raw)
+	case int64:
+		value = raw
+	case float64:
+		// config.json numbers are decoded as float64.
+		if raw != math.Trunc(raw) || raw > math.MaxInt64 || raw < math.MinInt64 {
+			return 0, invalidValueErr
+		}
+		value = int64(raw)
+	default:
+		return 0, fmt.Errorf("%s has unsupported type %T; %w", MaxPipelineVersionObjectBytesConfig, raw, invalidValueErr)
+	}
+
+	if value < 1 {
+		return 0, invalidValueErr
+	}
+	if value > MaximumPipelineVersionObjectBytes {
+		return 0, fmt.Errorf("%s must not exceed %d bytes: the Kubernetes API server cannot send requests over 2 MiB to etcd, "+
+			"and %d bytes are reserved for etcd request overhead. Larger PipelineVersion objects are rejected by Kubernetes regardless of this setting",
+			MaxPipelineVersionObjectBytesConfig, MaximumPipelineVersionObjectBytes, PipelineVersionObjectOverheadBytes)
+	}
+	return int(value), nil
 }
 
 // SizeLimitError contains only safe, operator-controlled rejection details.
@@ -105,4 +168,47 @@ func NewSizeLimitError(control string, limit int64, setting string) error {
 	err := &SizeLimitError{Control: control, Limit: limit, Setting: setting}
 	glog.Warningf("size_limit_exceeded control=%s limit_bytes=%d setting=%s: %s", control, limit, setting, err.Error())
 	return util.NewInvalidInputErrorWithDetails(err, err.Error())
+}
+
+const (
+	pipelineVersionTooLargeRemedy = "To fix this, make the compiled pipeline smaller, for example by moving embedded files, " +
+		"notebooks, or large inline Python code into a container image or object storage."
+	pipelineVersionUpdateTooLargeRemedy = "To fix this, use a shorter display name, or fewer or shorter tags, labels, or annotations."
+)
+
+// PipelineVersionObjectTooLargeMessage explains a new PipelineVersion rejected by the KFP size limit. It is
+// shown to API and kubectl users, so it says what happened, why, and what each audience can do.
+func PipelineVersionObjectTooLargeMessage(objectBytes int, limit int) string {
+	return fmt.Sprintf("The pipeline version is too large to store in Kubernetes: the PipelineVersion object is %d bytes (%.2f MiB) "+
+		"and the limit is %d bytes (%.2f MiB). "+
+		"Kubernetes stores each pipeline version as a single etcd object, so this limit applies even when the pipeline spec is within %s. "+
+		"%s Administrators can raise %s only after raising the etcd --max-request-bytes setting of the cluster to match.",
+		objectBytes, float64(objectBytes)/(1<<20), limit, float64(limit)/(1<<20),
+		MaxPipelineSpecBytesEnv, pipelineVersionTooLargeRemedy, MaxPipelineVersionObjectBytesConfig)
+}
+
+// PipelineVersionUpdateTooLargeMessage explains an update rejected because it grows a PipelineVersion past the
+// KFP size limit. Only the fields an update can change are offered as the remedy.
+func PipelineVersionUpdateTooLargeMessage(objectBytes int, previousBytes int, limit int) string {
+	return fmt.Sprintf("This update would make the pipeline version too large to store in Kubernetes: the PipelineVersion object "+
+		"would grow from %d bytes to %d bytes (%.2f MiB), and the limit is %d bytes (%.2f MiB). "+
+		"Kubernetes stores each pipeline version as a single etcd object. %s",
+		previousBytes, objectBytes, float64(objectBytes)/(1<<20), limit, float64(limit)/(1<<20),
+		pipelineVersionUpdateTooLargeRemedy)
+}
+
+// PipelineVersionRejectedByKubernetesMessage explains a new PipelineVersion that passed the KFP size check but
+// was rejected by a Kubernetes size limit, whose error reports neither the object size nor the limit.
+func PipelineVersionRejectedByKubernetesMessage() string {
+	return fmt.Sprintf("The pipeline version is too large to store in Kubernetes. "+
+		"Kubernetes stores each pipeline version as a single etcd object, which is limited to 1.5 MiB by default "+
+		"regardless of %s. %s Alternatively, use the database pipeline store.",
+		MaxPipelineSpecBytesEnv, pipelineVersionTooLargeRemedy)
+}
+
+// PipelineVersionUpdateRejectedByKubernetesMessage explains an update that a Kubernetes size limit rejected.
+func PipelineVersionUpdateRejectedByKubernetesMessage() string {
+	return "This update would make the pipeline version too large to store in Kubernetes. " +
+		"Kubernetes stores each pipeline version as a single etcd object, which is limited to 1.5 MiB by default. " +
+		pipelineVersionUpdateTooLargeRemedy
 }
