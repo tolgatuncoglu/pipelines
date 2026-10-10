@@ -490,3 +490,17 @@ func TestLogError(t *testing.T) {
 	regularError := fmt.Errorf("regular error")
 	LogError(regularError) // Just verify it doesn't panic
 }
+
+func TestAppendToUserMessage(t *testing.T) {
+	err := AppendToUserMessage(NewInvalidInputError("The pipeline version is too large."), "Retry by adding a version.")
+
+	userError, ok := err.(*UserError)
+	assert.True(t, ok)
+	assert.Equal(t, codes.InvalidArgument, userError.ExternalStatusCode())
+	assert.Equal(t, "The pipeline version is too large. Retry by adding a version.", userError.ExternalMessage())
+	assert.Contains(t, userError.Error(), "Retry by adding a version.")
+	assert.Contains(t, userError.Error(), "The pipeline version is too large.")
+
+	assert.Nil(t, AppendToUserMessage(nil, "Retry by adding a version."))
+	assert.EqualError(t, AppendToUserMessage(fmt.Errorf("boom"), "Retry by adding a version."), "Retry by adding a version.: boom")
+}

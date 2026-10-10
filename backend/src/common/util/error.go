@@ -362,6 +362,22 @@ func Wrap(err error, message string) error {
 	}
 }
 
+// AppendToUserMessage adds a sentence for the user, such as how to recover, to the user-facing message of a
+// UserError and keeps its status code. The sentence is also added to the internal error, which clients see
+// as the status message. Other errors are wrapped with the sentence.
+func AppendToUserMessage(err error, sentence string) error {
+	if err == nil {
+		return nil
+	}
+
+	switch err := err.(type) {
+	case *UserError:
+		return newUserError(errors.Wrap(err.internalError, sentence), err.externalMessage+" "+sentence, err.externalStatusCode)
+	default:
+		return errors.Wrapf(err, "%s", sentence)
+	}
+}
+
 func LogError(err error) {
 	switch err := err.(type) {
 	case *UserError:
