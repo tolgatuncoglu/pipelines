@@ -19,6 +19,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"os"
+
+	"github.com/kubeflow/pipelines/backend/src/common/util"
+	corev1 "k8s.io/api/core/v1"
 	"strconv"
 
 	"github.com/golang/glog"
@@ -356,10 +360,19 @@ func Container(ctx context.Context, opts Options, mlmd *metadata.Client, cacheCl
 		execution.ExecutorInput = executorInput
 	}
 
-	podSpecPatchBytes, err := json.Marshal(podSpec)
+	podSpecPatchBytes, err := marshalTaskPodSpecPatch(podSpec)
 	if err != nil {
 		return execution, fmt.Errorf("JSON marshaling pod spec patch: %w", err)
 	}
 	execution.PodSpecPatch = string(podSpecPatchBytes)
 	return execution, nil
+}
+
+func marshalTaskPodSpecPatch(podSpec *corev1.PodSpec) ([]byte, error) {
+	if os.Getenv(util.TaskTokenPathEnv) != "" {
+		if err := util.ValidateTaskRuntimePodPatch(podSpec); err != nil {
+			return nil, err
+		}
+	}
+	return json.Marshal(podSpec)
 }
