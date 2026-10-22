@@ -572,3 +572,15 @@ func formatParameterMacros(value *structpb.Value, formatter *util.ParameterForma
 		}
 	}
 }
+
+// PrepareTaskRuntimeCredentials preserves saved runtime images and supplies only
+// missing credentials for the configured workload clients in multi-user mode.
+func PrepareTaskRuntimeCredentials(execution util.ExecutionSpec) error {
+	if !common.IsMultiUserMode() {
+		return nil
+	}
+	return execution.EnsureTaskRuntimeCredentials(util.TaskRuntimeAuthConfig{
+		Audience: common.GetTokenReviewAudience(), DriverImage: argocompiler.GetDriverImage(), LauncherImage: argocompiler.GetLauncherImage(),
+		DriverCommand: argocompiler.GetDriverCommand(), LauncherCommand: argocompiler.GetLauncherCommand(),
+	})
+}
