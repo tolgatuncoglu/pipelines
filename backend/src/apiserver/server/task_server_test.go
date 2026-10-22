@@ -27,7 +27,7 @@ import (
 )
 
 func createTaskServer(resourceManager *resource.ResourceManager) *TaskServer {
-	return &TaskServer{resourceManager: resourceManager}
+	return NewTaskServer(resourceManager)
 }
 
 func TestNewTaskServer(t *testing.T) {

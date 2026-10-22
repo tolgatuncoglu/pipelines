@@ -16,6 +16,9 @@ package server
 
 import (
 	"context"
+
+	"github.com/kubeflow/pipelines/backend/src/apiserver/common"
+	authorizationv1 "k8s.io/api/authorization/v1"
 	"strings"
 
 	apiv1beta1 "github.com/kubeflow/pipelines/backend/api/v1beta1/go_client"
@@ -27,7 +30,7 @@ import (
 )
 
 type TaskServer struct {
-	resourceManager *resource.ResourceManager
+	*BaseRunServer
 	apiv1beta1.UnimplementedTaskServiceServer
 }
 
@@ -39,6 +42,9 @@ func (s *TaskServer) CreateTaskV1(ctx context.Context, request *api.CreateTaskRe
 		return nil, util.Wrap(err, "Failed to create a new task due to validation error")
 	}
 
+	if err := s.canAccessRun(ctx, request.GetTask().GetRunId(), &authorizationv1.ResourceAttributes{Verb: common.RbacResourceVerbCreateTask}); err != nil {
+		return nil, util.Wrap(err, "Failed to authorize task creation")
+	}
 	modelTask, err := toModelTask(request.GetTask())
 	if err != nil {
 		return nil, util.Wrap(err, "Failed to create a new task due to conversion error")
@@ -119,5 +125,5 @@ func (s *TaskServer) ListTasksV1(ctx context.Context, request *api.ListTasksRequ
 }
 
 func NewTaskServer(resourceManager *resource.ResourceManager) *TaskServer {
-	return &TaskServer{resourceManager: resourceManager}
+	return &TaskServer{BaseRunServer: &BaseRunServer{resourceManager: resourceManager}}
 }
