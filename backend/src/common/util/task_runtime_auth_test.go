@@ -94,3 +94,71 @@ func TestTaskRuntimePodPatch(t *testing.T) {
 	require.Error(t, ValidateTaskRuntimePodPatch(&corev1.PodSpec{Volumes: []corev1.Volume{{Name: "kfp-task-api-token"}}}))
 	require.Error(t, ValidateTaskRuntimePodPatch(&corev1.PodSpec{Containers: []corev1.Container{{Name: "main", VolumeMounts: []corev1.VolumeMount{{Name: "x", MountPath: "/var/run"}}}}}))
 }
+
+func TestTaskRuntimeCredentialsInlineRejected(t *testing.T) {
+	for _, steps := range []bool{false, true} {
+		w, config := taskAuthFixture()
+		inline := w.Spec.Templates[0].DeepCopy()
+		inline.Container.Image = "driver:unsupported"
+		root := wfapi.Template{Name: "root"}
+		if steps {
+			root.Steps = []wfapi.ParallelSteps{{Steps: []wfapi.WorkflowStep{{Name: "inline-driver", Inline: inline}}}}
+		} else {
+			root.DAG = &wfapi.DAGTemplate{Tasks: []wfapi.DAGTask{{Name: "inline-driver", Inline: inline}}}
+		}
+		w.Spec.Templates = []wfapi.Template{root}
+		before := w.Workflow.DeepCopy()
+		require.ErrorContains(t, w.EnsureTaskRuntimeCredentials(config), "inline")
+		require.Equal(t, before, w.Workflow)
+		require.ErrorContains(t, w.ValidateTaskRuntimeCredentials(config.Audience), "inline")
+	}
+}
+
+func TestTaskRuntimeCredentialsDefaultPatchPrecedence(t *testing.T) {
+	good := `{"containers":[{"name":"main","env":[{"name":"KF_PIPELINES_SA_TOKEN_PATH","value":"/var/run/secrets/kubeflow/pipelines/token"}]}]}`
+	bad := `{"containers":[{"name":"main","env":[{"name":"KF_PIPELINES_SA_TOKEN_PATH","value":"/missing/token"}]}]}`
+	for _, tc := range []struct {
+		name, defaults, workflow, template string
+		reject                             bool
+	}{
+		{name: "inherited default wins", defaults: bad, workflow: good, reject: true},
+		{name: "inherited default repairs workflow", defaults: good, workflow: bad},
+		{name: "own patch replaces default", defaults: bad, template: `{}`},
+		{name: "own patch overrides inherited repair", defaults: good, workflow: bad, template: `{}`, reject: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w, config := taskAuthFixture()
+			w.Spec.Templates = w.Spec.Templates[:1]
+			w.Spec.TemplateDefaults = &wfapi.Template{PodSpecPatch: tc.defaults}
+			w.Spec.PodSpecPatch = tc.workflow
+			w.Spec.Templates[0].PodSpecPatch = tc.template
+			before := w.Workflow.DeepCopy()
+			err := w.EnsureTaskRuntimeCredentials(config)
+			if tc.reject {
+				require.Error(t, err)
+				require.Equal(t, before, w.Workflow)
+			} else {
+				require.NoError(t, err)
+				require.NoError(t, w.ValidateTaskRuntimeCredentials(config.Audience))
+			}
+		})
+	}
+}
+
+func TestTaskRuntimeCredentialsLauncherHandoff(t *testing.T) {
+	for name, patch := range map[string]string{
+		"remove main mount":     `{"containers":[{"name":"main","volumeMounts":[{"mountPath":"/kfp-launcher","$patch":"delete"}]}]}`,
+		"replace main mount":    `{"containers":[{"name":"main","volumeMounts":[{"mountPath":"/kfp-launcher","name":"other"}]}]}`,
+		"shadow executable":     `{"containers":[{"name":"main","volumeMounts":[{"mountPath":"/kfp-launcher/launch","name":"other"}]}]}`,
+		"remove shared volume":  `{"volumes":[{"name":"kfp-launcher","$patch":"delete"}]}`,
+		"replace shared volume": `{"volumes":[{"name":"kfp-launcher","$patch":"replace","secret":{"secretName":"other"}}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			w, config := taskAuthFixture()
+			w.Status.Nodes = wfapi.Nodes{"completed-driver": wfapi.NodeStatus{Outputs: &wfapi.Outputs{Parameters: []wfapi.Parameter{{Name: "pod-spec-patch", Value: wfapi.AnyStringPtr(patch)}}}}}
+			before := w.Workflow.DeepCopy()
+			require.Error(t, w.EnsureTaskRuntimeCredentials(config))
+			require.Equal(t, before, w.Workflow)
+		})
+	}
+}

@@ -80,11 +80,20 @@ func taskRuntime(t *wfapi.Template) (*corev1.Container, error) {
 			init := &t.InitContainers[i].Container
 			if init.Name == "kfp-launcher" && reflect.DeepEqual(init.Args, []string{"--copy", "/kfp-launcher/launch"}) {
 				mount := func(c *corev1.Container) bool {
-					return slices.ContainsFunc(c.VolumeMounts, func(m corev1.VolumeMount) bool {
-						return m.Name == "kfp-launcher" && m.MountPath == "/kfp-launcher" && m.SubPath == "" && m.SubPathExpr == ""
-					})
+					count := 0
+					for _, m := range c.VolumeMounts {
+						if m.Name == "kfp-launcher" || shadowsDirectory(m.MountPath, "/kfp-launcher") {
+							if m.Name != "kfp-launcher" || m.MountPath != "/kfp-launcher" || m.SubPath != "" || m.SubPathExpr != "" {
+								return false
+							}
+							count++
+						}
+					}
+					return count == 1
 				}
-				if mount(init) && mount(t.Container) && slices.ContainsFunc(t.Volumes, func(v corev1.Volume) bool { return v.Name == "kfp-launcher" && v.EmptyDir != nil }) {
+				if mount(init) && mount(t.Container) && slices.ContainsFunc(t.Volumes, func(v corev1.Volume) bool {
+					return v.Name == "kfp-launcher" && v.EmptyDir != nil && reflect.DeepEqual(v.VolumeSource, corev1.VolumeSource{EmptyDir: v.EmptyDir})
+				}) {
 					return init, nil
 				}
 			}
@@ -93,9 +102,9 @@ func taskRuntime(t *wfapi.Template) (*corev1.Container, error) {
 	return nil, fmt.Errorf("template %q has an unsupported task runtime layout", t.Name)
 }
 
-func shadowsTaskToken(mountPath string) bool {
+func shadowsDirectory(mountPath, directory string) bool {
 	p := path.Clean(mountPath)
-	return p == taskTokenDirectory || strings.HasPrefix(taskTokenDirectory, p+"/") || strings.HasPrefix(p, taskTokenDirectory+"/") || p == "/" || strings.Contains(p, "{{")
+	return p == directory || strings.HasPrefix(directory, p+"/") || strings.HasPrefix(p, directory+"/") || p == "/" || strings.Contains(p, "{{")
 }
 
 // ValidateTaskRuntimePodPatch reserves credential fields for the compiler.
@@ -116,7 +125,7 @@ func ValidateTaskRuntimePodPatch(patch *corev1.PodSpec) error {
 			}
 		}
 		for _, m := range c.VolumeMounts {
-			if m.Name == taskTokenVolume || shadowsTaskToken(m.MountPath) {
+			if m.Name == taskTokenVolume || shadowsDirectory(m.MountPath, taskTokenDirectory) {
 				return fmt.Errorf("pod patch shadows the reserved task credential mount")
 			}
 		}
@@ -138,7 +147,7 @@ func ensureTaskToken(t *wfapi.Template, audience string, add bool) (bool, error)
 		}
 	}
 	for _, m := range t.Container.VolumeMounts {
-		if m.Name == taskTokenVolume || shadowsTaskToken(m.MountPath) {
+		if m.Name == taskTokenVolume || shadowsDirectory(m.MountPath, taskTokenDirectory) {
 			mounts++
 			if !reflect.DeepEqual(m, mount) {
 				return false, fmt.Errorf("conflicting task credential mount")
@@ -218,7 +227,18 @@ func (w *Workflow) checkTaskRuntimeStructure() error {
 	if w.Status.StoredWorkflowSpec != nil || len(w.Status.StoredTemplates) > 0 {
 		return fmt.Errorf("retained external task runtime templates cannot be prepared")
 	}
-	if err := w.validateNoExternalTemplateReferences(); err != nil {
+	// Compiler runtimes are top-level templates. Do not silently skip custom
+	// inline runtimes when deciding whether a saved workflow can be retried.
+	topLevel := map[*wfapi.Template]bool{w.Spec.TemplateDefaults: true}
+	for i := range w.Spec.Templates {
+		topLevel[&w.Spec.Templates[i]] = true
+	}
+	if err := w.walkTemplates(func(t *wfapi.Template) error {
+		if !topLevel[t] {
+			return fmt.Errorf("inline task runtime templates cannot be prepared")
+		}
+		return nil
+	}); err != nil {
 		return err
 	}
 	for _, v := range w.Spec.Volumes {
@@ -269,10 +289,13 @@ func (w *Workflow) ValidateTaskRuntimeCredentials(audience string) error {
 				return err
 			}
 		}
-		patches := []string{w.Spec.PodSpecPatch, t.PodSpecPatch}
-		if w.Spec.TemplateDefaults != nil {
-			patches = append([]string{w.Spec.TemplateDefaults.PodSpecPatch}, patches...)
+		// Argo inherits the default only when the template has no patch of
+		// its own, then applies workflow followed by effective template patch.
+		templatePatch := t.PodSpecPatch
+		if templatePatch == "" && w.Spec.TemplateDefaults != nil {
+			templatePatch = w.Spec.TemplateDefaults.PodSpecPatch
 		}
+		patches := []string{w.Spec.PodSpecPatch, templatePatch}
 		if err := validateTaskPatches(base, patches, audience, runtime == t.Container); err != nil {
 			return fmt.Errorf("template %q: %w", t.Name, err)
 		}
@@ -332,6 +355,15 @@ func validateTaskPatches(base corev1.PodSpec, patches []string, audience string,
 			return fmt.Errorf("pod patch changes the credential-aware driver")
 		}
 		if !driver {
+			// Validate the handoff after merging patches: the init binary can
+			// remain intact while main loses access to its shared executable.
+			tmpl.Metadata.Annotations = map[string]string{AnnotationKeyRuntimeRole: string(ExecutionRuntimeRoleLauncher)}
+			for _, init := range pod.InitContainers {
+				tmpl.InitContainers = append(tmpl.InitContainers, wfapi.UserContainer{Container: init})
+			}
+			if runtime, err := taskRuntime(&tmpl); err != nil || runtime == nil {
+				return fmt.Errorf("pod patch changes the launcher shared volume or mounts")
+			}
 			for _, init := range base.InitContainers {
 				if init.Name != "kfp-launcher" {
 					continue

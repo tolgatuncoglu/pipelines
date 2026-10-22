@@ -32,6 +32,9 @@ added only to recognized current credential-aware runtimes. An incompatible
 historical snapshot is rejected before a retry claim or pod deletion, with a log
 warning and an actionable error. The failed run remains intact. Create a new run
 from V2 IR if needed; this uses current templates but may repeat completed work.
+Inline custom runtime templates and retained external templates are outside this
+bounded preparation path and require an explicit update. Saved patches must keep
+the credential declarations and launcher shared volume/mounts intact.
 Old snapshots do not self-upgrade, and no cutoff date is imposed. Precompiled
 Argo/custom legacy runtime templates need their owner's explicit update.
 

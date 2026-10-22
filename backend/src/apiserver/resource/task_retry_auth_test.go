@@ -50,11 +50,7 @@ func (p *taskRetryPods) Delete(ctx context.Context, name string, opts metav1.Del
 }
 
 func TestRetryTaskCredentials(t *testing.T) {
-	for _, old := range []bool{false, true} {
-		name := "current"
-		if old {
-			name = "old"
-		}
+	for _, name := range []string{"current", "old", "inline runtime", "default patch", "saved launcher mount"} {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv(argocompiler.DriverImageEnvVar, "driver:patched")
 			t.Setenv(argocompiler.LauncherImageEnvVar, "launcher:patched")
@@ -63,7 +59,7 @@ func TestRetryTaskCredentials(t *testing.T) {
 			execution, err := util.NewExecutionSpecJSON(util.ArgoWorkflow, []byte(run.PipelineRuntimeManifest))
 			require.NoError(t, err)
 			wf := execution.(*util.Workflow)
-			if old {
+			if name == "old" {
 				for i := range wf.Spec.Templates {
 					for j := range wf.Spec.Templates[i].InitContainers {
 						if wf.Spec.Templates[i].InitContainers[j].Name == "kfp-launcher" {
@@ -75,6 +71,15 @@ func TestRetryTaskCredentials(t *testing.T) {
 			wf.Status.Phase = wfapi.WorkflowFailed
 			wf.Status.Nodes = wfapi.Nodes{"complete": wfapi.NodeStatus{ID: "complete", Name: "complete", Type: wfapi.NodeTypePod, Phase: wfapi.NodeSucceeded, Outputs: &wfapi.Outputs{Parameters: []wfapi.Parameter{{Name: "execution-id", Value: wfapi.AnyStringPtr("42")}}}}}
 			wf.Status.Nodes["failed"] = wfapi.NodeStatus{ID: "failed", Name: "failed", Type: wfapi.NodeTypePod, Phase: wfapi.NodeFailed}
+			switch name {
+			case "inline runtime":
+				wf.Spec.Templates = append(wf.Spec.Templates, wfapi.Template{Name: "inline-runtime", DAG: &wfapi.DAGTemplate{Tasks: []wfapi.DAGTask{{Name: "runtime", Inline: wf.Spec.Templates[0].DeepCopy()}}}})
+			case "default patch":
+				wf.Spec.TemplateDefaults = &wfapi.Template{PodSpecPatch: `{"containers":[{"name":"main","env":[{"name":"KF_PIPELINES_SA_TOKEN_PATH","value":"/missing/token"}]}]}`}
+				wf.Spec.PodSpecPatch = `{"containers":[{"name":"main","env":[{"name":"KF_PIPELINES_SA_TOKEN_PATH","value":"/var/run/secrets/kubeflow/pipelines/token"}]}]}`
+			case "saved launcher mount":
+				wf.Status.Nodes["complete"].Outputs.Parameters = append(wf.Status.Nodes["complete"].Outputs.Parameters, wfapi.Parameter{Name: "pod-spec-patch", Value: wfapi.AnyStringPtr(`{"containers":[{"name":"main","volumeMounts":[{"mountPath":"/kfp-launcher","$patch":"delete"}]}]}`)})
+			}
 			run.WorkflowRuntimeManifest = model.LargeText(wf.ToStringForStore())
 			run.State = model.RuntimeStateFailed
 			run.Conditions = string(model.RuntimeStateFailed.ToV1())
@@ -88,7 +93,7 @@ func TestRetryTaskCredentials(t *testing.T) {
 			err = manager.RetryRun(multiUserContext(), run.UUID)
 			after, getErr := manager.GetRun(run.UUID)
 			require.NoError(t, getErr)
-			if old {
+			if name != "current" {
 				require.ErrorContains(t, err, "new run")
 				require.Equal(t, before, after)
 				require.Zero(t, tracker.deletes)
