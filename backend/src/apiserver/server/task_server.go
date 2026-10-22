@@ -19,7 +19,6 @@ import (
 
 	"github.com/kubeflow/pipelines/backend/src/apiserver/common"
 	authorizationv1 "k8s.io/api/authorization/v1"
-	"strings"
 
 	apiv1beta1 "github.com/kubeflow/pipelines/backend/api/v1beta1/go_client"
 
@@ -72,15 +71,8 @@ func (s *TaskServer) validateCreateTaskRequest(request *api.CreateTaskRequest) e
 	if task.GetPipelineName() == "" {
 		return errMustSpecify("PipelineName")
 	}
-	if strings.HasPrefix(task.GetPipelineName(), "namespace/") {
-		s := strings.SplitN(task.GetPipelineName(), "/", 4)
-		if len(s) != 4 {
-			return util.NewInvalidInputError("invalid PipelineName for namespaced pipelines, need to follow 'namespace/${namespace}/pipeline/${pipelineName}': %s", task.GetPipelineName())
-		}
-		namespace := s[1]
-		if task.GetNamespace() != "" && namespace != task.GetNamespace() {
-			return util.NewInvalidInputError("the namespace %s extracted from pipelineName is not equal to the namespace %s in task", namespace, task.GetNamespace())
-		}
+	if err := util.ValidateTaskPipelineNamespace(task.GetPipelineName(), task.GetNamespace()); err != nil {
+		return err
 	}
 	if task.GetRunId() == "" {
 		return errMustSpecify("RunID")
