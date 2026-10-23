@@ -38,6 +38,7 @@ jobs:
     uses: ./.github/workflows/image-builds.yml
 
   api-integration-tests-v2:
+    needs: build
     runs-on: ubuntu-latest
     # Real ceiling for a hung suite. Without this the job inherits GitHub's
     # 6-hour default, and the go test -timeout below is the only hang-stop.
