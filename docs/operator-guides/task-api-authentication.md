@@ -26,13 +26,25 @@ Use driver and launcher images built with the credential-aware cache client.
 Set `V2_DRIVER_IMAGE` and `V2_LAUNCHER_IMAGE` to those tested image versions or
 digests on every API replica. An image string alone cannot establish that an
 older or custom binary sends credentials. The compiler projects a token for the
-actual workload service account with the API's `TOKEN_REVIEW_AUDIENCE` and sets
+actual workload service account with audience `TOKEN_REVIEW_AUDIENCE` plus
+`/task-write` (normally `pipelines.kubeflow.org/task-write`) and sets
 `KFP_TASK_API_TOKEN_PATH=/kfp-task-api/token`. This internal projection is separate
 from the SDK's `KF_PIPELINES_SA_TOKEN_PATH`; existing SDK token paths, projections
 and user `/var` mounts are preserved. The directory mount allows kubelet rotation;
 the client rereads the file through the existing cached token source. An identical
 internal path declaration is accepted. Conflicting reserved env/volume/mount
-fields are rejected in custom runtime or pod patches.
+fields are rejected in custom runtime or pod patches. These checks protect wiring
+and retry compatibility; they do not isolate credentials from component code.
+The launcher shares the user container, so user code can read the projected token.
+Only task-write authorization accepts this audience; normal API credentials remain
+accepted for task writes. Explicit projection still occurs when automatic Kubernetes
+token mounting is disabled (`automountServiceAccountToken: false`).
+
+The existing trusted identity-header authenticator remains enabled. Restrict direct
+API access to trusted proxies/workloads with the deployment's network and Istio
+policies, and strip caller-supplied identity headers at the trust boundary. A raw
+`kubeflow-userid` header is not evidence of identity on an untrusted direct path.
+The task-only audience does not secure a deployment that trusts forged headers.
 
 Existing V2 schedules and uploaded V2 IR need no recreation or SDK recompilation.
 Fresh ticks compile through the current API server. Default/custom service
@@ -42,7 +54,8 @@ The final API build enforces authorization immediately in multi-user mode. It ha
 no preparation-mode flag. A staged upgrade requires a separately delivered
 credential-preparation API/compiler build or release, with the runtime credential
 wiring and RBAC changes but without task-write enforcement. Deliver and test that
-artifact alongside credential-aware driver and launcher images before deploying
+artifact with the task-only audience above, alongside credential-aware driver and
+launcher images, before deploying
 the enforcing API build. Existing image tags in manifests do not prove that the
 images contain the new client; pin the actual tested versions or digests.
 
@@ -80,3 +93,14 @@ the available preparation artifact and tested runtime images, explain immediate
 enforcement and the whole-workflow drain boundary, and describe the unsupported
 historical-retry limitation and explicit new-run alternative. Do not advertise a
 seamless staged upgrade until those artifacts and deployment checks are available.
+
+## Authorization load
+
+Each task write performs TokenReview and SubjectAccessReview. The existing client
+limits default to 5 QPS and burst 10 for each Kubernetes client; task traffic shares
+the authentication and authorization clients with other API operations. Rehearse
+representative parallel/cache-heavy pipelines and user traffic, then size the
+existing `ClientQPS` and `ClientBurst` settings with the cluster administrator.
+No authentication or authorization decision cache is introduced: cached approvals
+would add a revocation window and require separate expiry, invalidation and memory
+bounds. Do not treat the local paced latency sample as a throughput qualification.

@@ -18,15 +18,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	api "github.com/kubeflow/pipelines/backend/api/v1beta1/go_client"
 	"github.com/kubeflow/pipelines/backend/src/apiserver/auth"
+	"github.com/kubeflow/pipelines/backend/src/apiserver/client"
 	"github.com/kubeflow/pipelines/backend/src/apiserver/common"
 	"github.com/kubeflow/pipelines/backend/src/apiserver/resource"
 	"github.com/spf13/viper"
@@ -134,6 +135,54 @@ func TestCreateTaskHTTPAuthorization(t *testing.T) {
 				require.Len(t, listed.Tasks, 1)
 			} else {
 				require.Empty(t, listed.Tasks)
+			}
+		})
+	}
+}
+
+// audienceReview models Kubernetes checking the token's audience against the
+// audiences requested by KFP. The token strings are synthetic test identifiers.
+type audienceReview struct{}
+
+func (audienceReview) Create(_ context.Context, r *authnv1.TokenReview, _ metav1.CreateOptions) (*authnv1.TokenReview, error) {
+	audience := "pipelines.kubeflow.org"
+	if r.Spec.Token == "task-only" {
+		audience += "/task-write"
+	}
+	accepted := false
+	for _, requested := range r.Spec.Audiences {
+		accepted = accepted || requested == audience
+	}
+	return &authnv1.TokenReview{Status: authnv1.TokenReviewStatus{Authenticated: accepted, Audiences: []string{audience}, User: authnv1.UserInfo{Username: "system:serviceaccount:ns1:custom-runner"}}}, nil
+}
+
+type audienceClientManager struct{ *resource.FakeClientManager }
+
+func (c audienceClientManager) TokenReviewClient() client.TokenReviewInterface {
+	return audienceReview{}
+}
+
+func TestTaskOnlyTokenCannotAuthorizeOtherRunOperations(t *testing.T) {
+	viper.Set(common.MultiUserMode, true)
+	t.Cleanup(func() { viper.Set(common.MultiUserMode, false) })
+	for _, token := range []string{"task-only", "general"} {
+		t.Run(token, func(t *testing.T) {
+			clients, _, run := initWithOneTimeRun(t)
+			defer clients.Close()
+			clients.AuthenticatorsFake = auth.GetAuthenticators(audienceReview{})
+			manager := resource.NewResourceManager(audienceClientManager{clients}, &resource.ResourceManagerOptions{})
+			ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("authorization", "Bearer "+token))
+			result, err := NewTaskServer(manager).CreateTaskV1(ctx, &api.CreateTaskRequest{Task: &api.Task{PipelineName: "pipeline/test", RunId: run.UUID, MlmdExecutionID: "42", Fingerprint: "fp", CreatedAt: timestamppb.New(time.Unix(1, 0))}})
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			runServer := &BaseRunServer{resourceManager: manager}
+			for _, verb := range []string{common.RbacResourceVerbGet, common.RbacResourceVerbDelete, common.RbacResourceVerbRetry} {
+				err := runServer.canAccessRun(ctx, run.UUID, &authzv1.ResourceAttributes{Verb: verb})
+				if token == "task-only" {
+					require.Error(t, err, verb)
+				} else {
+					require.NoError(t, err, verb)
+				}
 			}
 		})
 	}

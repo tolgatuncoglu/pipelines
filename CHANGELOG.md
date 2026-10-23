@@ -10,6 +10,9 @@ normal deployment upgrade process; eligible schedules are adopted automatically.
 
 #### Task/cache-write authentication
 
+- Compiler-projected task credentials use a separate task-write audience accepted
+  only for task writes. The token remains readable by component code and is
+  explicitly projected even with Kubernetes token automount disabled.
 - Multi-user task/cache writes require `createTask` on resource `runs` in API
   group `pipelines.kubeflow.org`, in the owning run namespace. Ship authorization
   and authoritative namespace binding together. Update custom Kubernetes roles;

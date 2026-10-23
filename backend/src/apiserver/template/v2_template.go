@@ -153,7 +153,7 @@ func (t *V2Spec) ScheduledWorkflow(modelJob *model.Job) (*scheduledworkflow.Sche
 			DriverPodConfig: common.GetDriverPodConfig(),
 		}
 		if common.IsMultiUserMode() {
-			opts.TaskTokenAudience = common.GetTokenReviewAudience()
+			opts.TaskTokenAudience = common.GetTaskTokenReviewAudience()
 		}
 		obj, err = argocompiler.Compile(job, kubernetesSpec, opts)
 	}
@@ -395,7 +395,7 @@ func (t *V2Spec) RunWorkflow(modelRun *model.Run, options RunWorkflowOptions) (u
 			DriverPodConfig: common.GetDriverPodConfig(),
 		}
 		if common.IsMultiUserMode() {
-			opts.TaskTokenAudience = common.GetTokenReviewAudience()
+			opts.TaskTokenAudience = common.GetTaskTokenReviewAudience()
 		}
 		obj, err = argocompiler.Compile(job, kubernetesSpec, opts)
 	}
@@ -580,7 +580,7 @@ func PrepareTaskRuntimeCredentials(execution util.ExecutionSpec) error {
 		return nil
 	}
 	return execution.EnsureTaskRuntimeCredentials(util.TaskRuntimeAuthConfig{
-		Audience: common.GetTokenReviewAudience(), DriverImage: argocompiler.GetDriverImage(), LauncherImage: argocompiler.GetLauncherImage(),
+		Audience: common.GetTaskTokenReviewAudience(), DriverImage: argocompiler.GetDriverImage(), LauncherImage: argocompiler.GetLauncherImage(),
 		DriverCommand: argocompiler.GetDriverCommand(), LauncherCommand: argocompiler.GetLauncherCommand(),
 	})
 }

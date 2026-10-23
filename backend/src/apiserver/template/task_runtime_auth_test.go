@@ -51,7 +51,7 @@ func TestRunWorkflowTaskCredentials(t *testing.T) {
 		require.NoError(t, json.Unmarshal([]byte(exec.ToStringForStore()), &wf))
 		require.Equal(t, "custom-runner", wf.Spec.ServiceAccountName)
 		require.Equal(t, "team-a", wf.Namespace)
-		require.NoError(t, util.NewWorkflow(&wf).ValidateTaskRuntimeCredentials(common.GetTokenReviewAudience()))
+		require.NoError(t, util.NewWorkflow(&wf).ValidateTaskRuntimeCredentials("pipelines.kubeflow.org/task-write"))
 	}
 	require.Equal(t, before, string(src.Bytes()))
 	viper.Set(common.MultiUserMode, false)

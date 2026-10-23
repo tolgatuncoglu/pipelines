@@ -20,14 +20,12 @@ import (
 	"fmt"
 	"maps"
 	"os"
-
-	"github.com/kubeflow/pipelines/backend/src/common/util"
-	corev1 "k8s.io/api/core/v1"
 	"strconv"
 
 	"github.com/golang/glog"
 	"github.com/google/uuid"
 	"github.com/kubeflow/pipelines/api/v2alpha1/go/pipelinespec"
+	"github.com/kubeflow/pipelines/backend/src/common/util"
 	"github.com/kubeflow/pipelines/backend/src/v2/cacheutils"
 	"github.com/kubeflow/pipelines/backend/src/v2/common/plugins"
 	"github.com/kubeflow/pipelines/backend/src/v2/expression"
@@ -35,6 +33,7 @@ import (
 	pb "github.com/kubeflow/pipelines/third_party/ml-metadata/go/ml_metadata"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/structpb"
+	corev1 "k8s.io/api/core/v1"
 )
 
 func validateContainer(opts Options) (err error) {

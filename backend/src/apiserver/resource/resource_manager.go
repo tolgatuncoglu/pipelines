@@ -3976,7 +3976,14 @@ func (r *ResourceManager) isAuthorized(ctx context.Context, resourceAttributes *
 	// based on the namespace field in the request.
 	errlist := make([]error, 0)
 	userIdentity := ""
-	for _, auth := range r.authenticators {
+	authenticators := r.authenticators
+	if resourceAttributes.Group == common.RbacPipelinesGroup && resourceAttributes.Resource == common.RbacResourceTypeRuns && resourceAttributes.Verb == common.RbacResourceVerbCreateTask {
+		// The projected runtime token must never authenticate another API operation.
+		// Retain normal authenticators for existing API clients and trusted proxies.
+		taskAuthenticator := kfpauth.NewTokenReviewAuthenticator(common.AuthorizationBearerTokenHeader, common.AuthorizationBearerTokenPrefix, []string{common.GetTaskTokenReviewAudience()}, r.tokenReviewClient)
+		authenticators = append([]kfpauth.Authenticator{taskAuthenticator}, authenticators...)
+	}
+	for _, auth := range authenticators {
 		identity, err := auth.GetUserIdentity(ctx)
 		if err == nil {
 			userIdentity = identity
