@@ -1,4 +1,4 @@
-// Copyright 2022 The Kubeflow Authors
+// Copyright 2026 The Kubeflow Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,8 +15,9 @@
 package util
 
 import (
-	"github.com/stretchr/testify/require"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestValidateTaskPipelineNamespace(t *testing.T) {

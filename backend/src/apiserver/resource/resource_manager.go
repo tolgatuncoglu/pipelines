@@ -1244,6 +1244,7 @@ func (r *ResourceManager) CreateTask(t *model.Task) (*model.Task, error) {
 	if common.IsMultiUserMode() {
 		// Use the same persisted ownership that authorizes this run. A task
 		// cannot select an experiment's different namespace or its own owner.
+		// Consult the experiment only for legacy runs without a stored owner.
 		namespace, err := r.GetNamespaceFromRun(run)
 		if err != nil {
 			return nil, util.Wrapf(err, "Failed to resolve task namespace for run %v", t.RunID)

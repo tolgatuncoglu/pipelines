@@ -1,4 +1,4 @@
-// Copyright 2022 The Kubeflow Authors
+// Copyright 2026 The Kubeflow Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -38,7 +38,7 @@ func TestTaskNamespaceUsesRunOwner(t *testing.T) {
 		{name: "legacy sentinel", runNS: "-", experimentNS: "team-a", want: "team-a"},
 		{name: "legacy reference", legacyRef: true, want: "team-a"},
 		{name: "unresolved multi-user", reject: true},
-		{name: "single-user", single: true},
+		{name: "single-user", single: true, want: ""},
 		{name: "single-user supplied", single: true, requested: "legacy", want: "legacy"},
 		{name: "imported", runNS: "team-a", experimentNS: "team-a", imported: true, reject: true},
 	} {
