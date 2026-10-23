@@ -8,6 +8,27 @@ normal deployment upgrade process; eligible schedules are adopted automatically.
 
 ### Upgrade notes
 
+#### Task/cache-write authentication
+
+- Multi-user task/cache writes require `createTask` on resource `runs` in API
+  group `pipelines.kubeflow.org`, in the owning run namespace. Ship authorization
+  and authoritative namespace binding together. Update custom Kubernetes roles;
+  custom-named service accounts already bound to updated standard roles may
+  inherit the permission. Existing group-only grants are insufficient on the
+  TokenReview path; use a direct workload-service-account binding where needed.
+- The final API enforces immediately. First deliver and qualify a separate
+  credential-preparation API/compiler build, credential-aware driver/launcher
+  images and RBAC. After all API replicas prepare new workflows, let older whole
+  workflows finish, including pending steps and automatic retries, before
+  enforcement. Existing V2 schedules can continue creating prepared executions.
+  Name the preparation release and tested image versions/digests before shipping;
+  the source changes alone do not establish rollout readiness.
+- Uploaded V2 IR and supported schedules need no recreation or recompilation.
+  Unsupported historical retries fail before state changes or pod deletion;
+  explicitly creating a new run is the alternative and may repeat completed work.
+  Old snapshots do not self-upgrade. Single-user behavior is unchanged. See the
+  [task API upgrade procedure](docs/operator-guides/task-api-authentication.md).
+
 #### Artifact ownership compatibility
 
 The stronger artifact ownership requirement is deferred to 3.0. Version 2.18

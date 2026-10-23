@@ -22,6 +22,7 @@ not complete end-user roles.
 | Upload a pipeline version | `create` on `pipelines.pipelines.kubeflow.org` | Parent pipeline namespace; installation namespace for shared parents | Use the intended parent pipeline ID; changing client namespace does not relocate it. |
 | Create a run or recurring run referencing a private pipeline/version | `get` on `pipelines.pipelines.kubeflow.org` | Parent pipeline namespace | Use an experiment in the same namespace as the private pipeline. |
 | Read run logs | `readLog` on `runs.pipelines.kubeflow.org` | Run namespace | Add the custom verb to log-reader roles. |
+| Write task/cache records | `createTask` on `runs.pipelines.kubeflow.org` | Owning run namespace | Update custom roles and credential-aware runtimes before enforcement; see [task API upgrades](task-api-authentication.md). An account bound to an updated standard role may already inherit the permission. |
 | View an existing TensorBoard | `get` on `viewers.kubeflow.org` | Viewer namespace | Retain read access for viewers. |
 | Create or delete TensorBoard | `create` or `delete` on `viewers.kubeflow.org` | Viewer namespace | Give these permissions only to users who should manage TensorBoard instances. |
 
