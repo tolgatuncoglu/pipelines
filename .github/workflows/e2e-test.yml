@@ -82,6 +82,7 @@ jobs:
     uses: ./.github/workflows/image-builds.yml
 
   end-to-end-scenario-tests:
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -273,6 +274,7 @@ jobs:
           ca_cert_path: ${{ env.CA_CERT_PATH }}
 
   end-to-end-critical-scenario-multi-user-tests:
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -376,6 +378,7 @@ jobs:
 
 
   end-to-end-critical-mlflow-tests:
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       actions: read
