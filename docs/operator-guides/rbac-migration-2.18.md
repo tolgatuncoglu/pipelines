@@ -179,7 +179,8 @@ Inspect `status.allowed`, `status.denied`, `status.reason` and
 `status.evaluationError`. An evaluation error is inconclusive, not evidence that
 broader grants are needed. Do not assume impersonation or an identity header
 supplies the same groups as the production authentication path. For a service
-account, use `system:serviceaccount:<namespace>:<name>` and its effective groups.
+account, use `system:serviceaccount:<namespace>:<name>` and omit groups to match
+KFP's SubjectAccessReview request.
 
 Repeat with these `resourceAttributes`, keeping the caller identity and
 `version: v1beta1` unchanged:
@@ -190,6 +191,7 @@ Repeat with these `resourceAttributes`, keeping the caller identity and
 | Shared upload | `pipelines.kubeflow.org` | `pipelines` | `create` | Actual API `POD_NAMESPACE` | Omit |
 | Private reference | `pipelines.kubeflow.org` | `pipelines` | `get` | Owning profile | Parent pipeline name, not UUID |
 | Logs | `pipelines.kubeflow.org` | `runs` | `readLog` | Run namespace | Persisted run `K8SName` (omit if empty) |
+| Task/cache writes | `pipelines.kubeflow.org` | `runs` | `createTask` | Owning run namespace | Persisted run `K8SName` (omit if empty) |
 | Inspect TensorBoard | `kubeflow.org` | `viewers` | `get` | Viewer namespace | Omit |
 | Manage TensorBoard | `kubeflow.org` | `viewers` | `create` or `delete` | Viewer namespace | Omit |
 
