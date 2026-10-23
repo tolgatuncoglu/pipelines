@@ -38,6 +38,7 @@ jobs:
     uses: ./.github/workflows/image-builds.yml
 
   initialization-integration-tests-v1:
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       actions: read
