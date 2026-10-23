@@ -96,11 +96,47 @@ seamless staged upgrade until those artifacts and deployment checks are availabl
 
 ## Authorization load
 
-Each task write performs TokenReview and SubjectAccessReview. The existing client
-limits default to 5 QPS and burst 10 for each Kubernetes client; task traffic shares
-the authentication and authorization clients with other API operations. Rehearse
-representative parallel/cache-heavy pipelines and user traffic, then size the
-existing `ClientQPS` and `ClientBurst` settings with the cluster administrator.
-No authentication or authorization decision cache is introduced: cached approvals
-would add a revocation window and require separate expiry, invalidation and memory
-bounds. Do not treat the local paced latency sample as a throughput qualification.
+Task-only credentials require one TokenReview and one SubjectAccessReview per
+write. Ordinary API credentials can require two TokenReviews because the task-only
+check precedes the existing trusted-header/ordinary-token authenticators. That
+order, audience validation and denial behavior are unchanged.
+
+TokenReview and SubjectAccessReview have separate client token buckets. Each uses
+these settings, resolved independently per field:
+
+| Setting | Environment variable | Precedence | Default |
+| --- | --- | --- | --- |
+| `AuthClientQPS` | `AUTHCLIENTQPS` | Auth setting, explicit `ClientQPS`, default | 40 |
+| `AuthClientBurst` | `AUTHCLIENTBURST` | Auth setting, explicit `ClientBurst`, default | 80 |
+
+These are API-server configuration keys; environment variables follow the existing
+Viper convention. General workflow/Kubernetes clients retain their existing
+`ClientQPS`/`ClientBurst` defaults of 5/10. Explicit positive legacy settings remain
+effective for reviews unless the corresponding auth setting overrides them. For
+example, an explicit `ClientQPS=5` still limits reviews to 5 QPS; set
+`AuthClientQPS` explicitly to change only the authorization budget.
+
+The bounded 40-QPS default budgets two TokenReviews for the measured workload of
+20 ordinary-token writes per second; burst 80 permits two seconds of review tokens.
+It is a starting point, not a production capacity guarantee. Each API replica has
+its own buckets, shared by all of that replica's authenticated API operations.
+At the defaults, the two review clients together can issue up to 80 review requests
+per second per replica after burst tokens are exhausted. Size total replica count,
+other API traffic and Kubernetes API capacity with the cluster administrator.
+
+QPS must be positive, finite and representable as a positive float32; burst must be
+a positive integer. Invalid authorization settings fail startup rather than disable
+rate limiting. This also applies to inherited legacy values. If unrelated clients
+use a nonpositive legacy rate, provide explicit positive auth settings. Single-user
+and webhook-only operation do not initialize these review clients.
+
+Rehearse representative parallel/cache-heavy pipelines and user traffic, including
+ordinary credentials. Measure client wait time separately from Kubernetes HTTP
+latency/errors and task persistence. No authentication or authorization decision
+cache is introduced, and each request still rechecks identity and permission.
+
+The shipping release notes must include these review-client defaults and override
+precedence alongside the credential/RBAC/upgrade requirements above. Preparation
+credentials and their audiences are unchanged by this capacity adjustment; the
+preparation task endpoint still performs no authorization reviews. Image and
+whole-workflow upgrade qualification remain required.
