@@ -2,31 +2,60 @@
 
 In multi-user deployments, task creation requires an authenticated caller with
 `createTask` on `runs` in `pipelines.kubeflow.org` in the stored run namespace.
-The shipped pipeline-runner and edit roles include that permission. Bind an
-equivalent namespaced role for custom workload service accounts; retain their
-existing service-account `use` permissions. Single-user operation is unchanged.
+Task authorization and authoritative run-namespace binding must ship together;
+authorization alone can leave task storage using a different experiment namespace.
+Single-user operation is unchanged.
+
+The shipped pipeline-runner and edit roles include the new permission. Custom
+Kubernetes roles must grant this exact rule in the owning run's namespace:
+
+```yaml
+apiGroups: [pipelines.kubeflow.org]
+resources: [runs]
+verbs: [createTask]
+```
+
+Check effective permissions, not the service-account name. A custom service
+account bound to an updated standard role may already inherit this permission.
+Retain existing service-account `use` permissions. The existing TokenReview
+authentication path passes the username, but not authenticated groups, to
+SubjectAccessReview. A group-only grant is therefore insufficient on this path;
+use a direct binding to the workload service account where necessary.
 
 Use driver and launcher images built with the credential-aware cache client.
 Set `V2_DRIVER_IMAGE` and `V2_LAUNCHER_IMAGE` to those tested image versions or
 digests on every API replica. An image string alone cannot establish that an
 older or custom binary sends credentials. The compiler projects a token for the
 actual workload service account with the API's `TOKEN_REVIEW_AUDIENCE` and sets
-`KF_PIPELINES_SA_TOKEN_PATH`. The directory mount allows kubelet rotation; the
-client rereads the file through the existing cached token source. Keep these
-reserved env/volume/mount fields intact in custom runtime or pod patches.
+`KFP_TASK_API_TOKEN_PATH=/kfp-task-api/token`. This internal projection is separate
+from the SDK's `KF_PIPELINES_SA_TOKEN_PATH`; existing SDK token paths, projections
+and user `/var` mounts are preserved. The directory mount allows kubelet rotation;
+the client rereads the file through the existing cached token source. An identical
+internal path declaration is accepted. Conflicting reserved env/volume/mount
+fields are rejected in custom runtime or pod patches.
 
 Existing V2 schedules and uploaded V2 IR need no recreation or SDK recompilation.
 Fresh ticks compile through the current API server. Default/custom service
 accounts, version selection, replay and scheduling policies are preserved.
 
-Roll out the credential-aware runtime images, compiler output and RBAC before
-server enforcement. After every API replica is prepared, let whole workflows
-created before that boundary finish, including pending steps and automatic Argo
-retries. Recurring schedules can continue creating prepared workflows. The
-preparation stage alone does not enforce task authorization. Running old pods
-cannot gain the new client or missing token mounts from an API upgrade.
+The final API build enforces authorization immediately in multi-user mode. It has
+no preparation-mode flag. A staged upgrade requires a separately delivered
+credential-preparation API/compiler build or release, with the runtime credential
+wiring and RBAC changes but without task-write enforcement. Deliver and test that
+artifact alongside credential-aware driver and launcher images before deploying
+the enforcing API build. Existing image tags in manifests do not prove that the
+images contain the new client; pin the actual tested versions or digests.
 
-Explicit retry preserves saved images, completed nodes and outputs. Prepared
+After every API replica runs the preparation build and selects the tested runtime
+images, let whole workflows created before that boundary finish, including pending
+steps and automatic Argo retries. Recurring V2 schedules can continue creating
+prepared workflows. Preparation alone retains the old task authorization behavior
+and is not the completed security fix. Then deploy authorization and namespace
+binding together. Running old pods cannot gain the new client or missing token
+mounts from an API upgrade. Cache-write failures remain fatal; deploying enforcement
+before preparation can fail an old launcher after its user container succeeds.
+
+Supported explicit V2 retry preserves saved images, completed nodes and outputs. Prepared
 workflows receive fresh tokens in recreated pods. Missing credentials can be
 added only to recognized current credential-aware runtimes. An incompatible
 historical snapshot is rejected before a retry claim or pod deletion, with a log
@@ -41,3 +70,13 @@ Argo/custom legacy runtime templates need their owner's explicit update.
 Verify actual images, projected-token rotation, cache misses/hits, PVC tasks,
 existing/new schedules and custom service accounts in an isolated environment
 before enforcement. Offline tests do not establish cluster rollout compatibility.
+
+## Required shipping release note
+
+The release that first ships task-write enforcement must document the new
+`createTask` permission on `runs` in `pipelines.kubeflow.org`, the owning-namespace
+scope, and the custom-role/direct-binding requirements above. It must also name
+the available preparation artifact and tested runtime images, explain immediate
+enforcement and the whole-workflow drain boundary, and describe the unsupported
+historical-retry limitation and explicit new-run alternative. Do not advertise a
+seamless staged upgrade until those artifacts and deployment checks are available.

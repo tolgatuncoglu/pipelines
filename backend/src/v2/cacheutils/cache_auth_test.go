@@ -40,7 +40,8 @@ func (s *recordingTaskClient) CreateTaskV1(ctx context.Context, request *api.Cre
 func TestCreateExecutionCacheAuthentication(t *testing.T) {
 	tokenFile := filepath.Join(t.TempDir(), "token")
 	require.NoError(t, os.WriteFile(tokenFile, []byte("dummy-token"), 0600))
-	t.Setenv("KF_PIPELINES_SA_TOKEN_PATH", tokenFile)
+	t.Setenv("KFP_TASK_API_TOKEN_PATH", tokenFile)
+	t.Setenv("KF_PIPELINES_SA_TOKEN_PATH", filepath.Join(t.TempDir(), "user-sdk-token"))
 	value, err := NewClient("localhost", "1", false, nil)
 	require.NoError(t, err)
 	c := value.(*client)
@@ -69,7 +70,7 @@ func TestCreateExecutionCacheAuthentication(t *testing.T) {
 }
 
 func TestCreateExecutionCacheMissingCredential(t *testing.T) {
-	t.Setenv("KF_PIPELINES_SA_TOKEN_PATH", filepath.Join(t.TempDir(), "missing"))
+	t.Setenv("KFP_TASK_API_TOKEN_PATH", filepath.Join(t.TempDir(), "missing"))
 	value, err := NewClient("localhost", "1", false, nil)
 	require.NoError(t, err)
 	c := value.(*client)
@@ -82,7 +83,7 @@ func TestCreateExecutionCacheMissingCredential(t *testing.T) {
 }
 
 func TestCreateExecutionCacheSingleUser(t *testing.T) {
-	t.Setenv("KF_PIPELINES_SA_TOKEN_PATH", "")
+	t.Setenv("KFP_TASK_API_TOKEN_PATH", "")
 	value, err := NewClient("localhost", "1", false, nil)
 	require.NoError(t, err)
 	c := value.(*client)

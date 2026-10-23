@@ -30,10 +30,10 @@ import (
 
 const (
 	// TaskTokenPathEnv selects the projected workload credential used for task writes.
-	TaskTokenPathEnv = "KF_PIPELINES_SA_TOKEN_PATH"
-	// TaskTokenPath follows the existing KFP API client token path convention.
-	TaskTokenPath      = "/var/run/secrets/kubeflow/pipelines/token"
-	taskTokenDirectory = "/var/run/secrets/kubeflow/pipelines"
+	TaskTokenPathEnv = "KFP_TASK_API_TOKEN_PATH"
+	// TaskTokenPath is separate from user SDK credentials and /var mounts.
+	TaskTokenPath      = "/kfp-task-api/token"
+	taskTokenDirectory = "/kfp-task-api"
 	taskTokenVolume    = "kfp-task-api-token"
 )
 
@@ -61,8 +61,14 @@ func argumentValue(args []string, name string) string {
 
 // taskRuntime returns the binary container for a task writer, or nil for a DAG/importer.
 func taskRuntime(t *wfapi.Template) (*corev1.Container, error) {
+	if t.Script != nil || t.ContainerSet != nil || t.Resource != nil || t.Data != nil || t.HTTP != nil || t.Plugin != nil || t.Suspend != nil {
+		return nil, fmt.Errorf("template %q has an unsupported task runtime layout", t.Name)
+	}
 	if t.Container == nil {
-		return nil, nil
+		if t.DAG != nil || t.Steps != nil {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("template %q has an unsupported task runtime layout", t.Name)
 	}
 	switch t.Metadata.Annotations[AnnotationKeyRuntimeRole] {
 	case string(ExecutionRuntimeRoleDriver):
@@ -120,7 +126,7 @@ func ValidateTaskRuntimePodPatch(patch *corev1.PodSpec) error {
 			continue
 		}
 		for _, e := range c.Env {
-			if e.Name == TaskTokenPathEnv {
+			if e.Name == TaskTokenPathEnv && !reflect.DeepEqual(e, corev1.EnvVar{Name: TaskTokenPathEnv, Value: TaskTokenPath}) {
 				return fmt.Errorf("pod patch overrides reserved task credential environment %q", TaskTokenPathEnv)
 			}
 		}

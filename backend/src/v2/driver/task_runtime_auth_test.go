@@ -27,8 +27,12 @@ func TestContainerTaskCredentialPatchCollision(t *testing.T) {
 	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: "user-image", Command: []string{"user-command"}, Env: []corev1.EnvVar{{Name: util.TaskTokenPathEnv, Value: "/user/token"}}}}}
 	_, err := marshalTaskPodSpecPatch(pod)
 	require.Error(t, err)
-	pod.Containers[0].Env = nil
+	pod.Containers[0].Env = []corev1.EnvVar{{Name: util.TaskTokenPathEnv, Value: util.TaskTokenPath}, {Name: "KF_PIPELINES_SA_TOKEN_PATH", Value: "/custom/sdk/token"}}
 	raw, err := marshalTaskPodSpecPatch(pod)
+	require.NoError(t, err)
+	require.Contains(t, string(raw), "/custom/sdk/token")
+	pod.Containers[0].Env = nil
+	raw, err = marshalTaskPodSpecPatch(pod)
 	require.NoError(t, err)
 	require.Contains(t, string(raw), "user-image")
 	require.Contains(t, string(raw), "user-command")

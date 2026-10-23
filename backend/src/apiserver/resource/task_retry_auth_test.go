@@ -26,6 +26,8 @@ import (
 	"github.com/kubeflow/pipelines/backend/src/v2/compiler/argocompiler"
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	coreclient "k8s.io/client-go/kubernetes/typed/core/v1"
 )
@@ -50,7 +52,7 @@ func (p *taskRetryPods) Delete(ctx context.Context, name string, opts metav1.Del
 }
 
 func TestRetryTaskCredentials(t *testing.T) {
-	for _, name := range []string{"current", "old", "inline runtime", "default patch", "saved launcher mount"} {
+	for _, name := range []string{"current", "old", "inline runtime", "default patch", "saved launcher mount", "script runtime", "container set runtime"} {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv(argocompiler.DriverImageEnvVar, "driver:patched")
 			t.Setenv(argocompiler.LauncherImageEnvVar, "launcher:patched")
@@ -72,11 +74,24 @@ func TestRetryTaskCredentials(t *testing.T) {
 			wf.Status.Nodes = wfapi.Nodes{"complete": wfapi.NodeStatus{ID: "complete", Name: "complete", Type: wfapi.NodeTypePod, Phase: wfapi.NodeSucceeded, Outputs: &wfapi.Outputs{Parameters: []wfapi.Parameter{{Name: "execution-id", Value: wfapi.AnyStringPtr("42")}}}}}
 			wf.Status.Nodes["failed"] = wfapi.NodeStatus{ID: "failed", Name: "failed", Type: wfapi.NodeTypePod, Phase: wfapi.NodeFailed}
 			switch name {
+			case "script runtime", "container set runtime":
+				for i := range wf.Spec.Templates {
+					tmpl := &wf.Spec.Templates[i]
+					if tmpl.Container == nil || tmpl.Metadata.Annotations[util.AnnotationKeyRuntimeRole] != "driver" {
+						continue
+					}
+					if name == "script runtime" {
+						tmpl.Script = &wfapi.ScriptTemplate{Container: *tmpl.Container.DeepCopy(), Source: "echo unused"}
+					} else {
+						tmpl.ContainerSet = &wfapi.ContainerSetTemplate{}
+					}
+					tmpl.Container = nil
+				}
 			case "inline runtime":
 				wf.Spec.Templates = append(wf.Spec.Templates, wfapi.Template{Name: "inline-runtime", DAG: &wfapi.DAGTemplate{Tasks: []wfapi.DAGTask{{Name: "runtime", Inline: wf.Spec.Templates[0].DeepCopy()}}}})
 			case "default patch":
-				wf.Spec.TemplateDefaults = &wfapi.Template{PodSpecPatch: `{"containers":[{"name":"main","env":[{"name":"KF_PIPELINES_SA_TOKEN_PATH","value":"/missing/token"}]}]}`}
-				wf.Spec.PodSpecPatch = `{"containers":[{"name":"main","env":[{"name":"KF_PIPELINES_SA_TOKEN_PATH","value":"/var/run/secrets/kubeflow/pipelines/token"}]}]}`
+				wf.Spec.TemplateDefaults = &wfapi.Template{PodSpecPatch: `{"containers":[{"name":"main","env":[{"name":"KFP_TASK_API_TOKEN_PATH","value":"/missing/token"}]}]}`}
+				wf.Spec.PodSpecPatch = `{"containers":[{"name":"main","env":[{"name":"KFP_TASK_API_TOKEN_PATH","value":"/kfp-task-api/token"}]}]}`
 			case "saved launcher mount":
 				wf.Status.Nodes["complete"].Outputs.Parameters = append(wf.Status.Nodes["complete"].Outputs.Parameters, wfapi.Parameter{Name: "pod-spec-patch", Value: wfapi.AnyStringPtr(`{"containers":[{"name":"main","volumeMounts":[{"mountPath":"/kfp-launcher","$patch":"delete"}]}]}`)})
 			}
@@ -95,6 +110,7 @@ func TestRetryTaskCredentials(t *testing.T) {
 			require.NoError(t, getErr)
 			if name != "current" {
 				require.ErrorContains(t, err, "new run")
+				require.Equal(t, codes.FailedPrecondition, status.Code(err))
 				require.Equal(t, before, after)
 				require.Zero(t, tracker.deletes)
 			} else {
