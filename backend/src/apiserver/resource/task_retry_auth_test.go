@@ -118,7 +118,7 @@ func TestRetryTaskCredentials(t *testing.T) {
 				updated, err := store.ExecClient().Execution(run.Namespace).Get(context.Background(), run.K8SName, metav1.GetOptions{})
 				require.NoError(t, err)
 				got := updated.(*util.Workflow)
-				require.NoError(t, got.ValidateTaskRuntimeCredentials(common.GetTokenReviewAudience()))
+				require.NoError(t, got.ValidateTaskRuntimeCredentials(common.GetTaskTokenReviewAudience()))
 				require.Equal(t, wf.Status.Nodes["complete"], got.Status.Nodes["complete"])
 				require.Equal(t, wf.Spec.ServiceAccountName, got.Spec.ServiceAccountName)
 				require.Equal(t, wf.Name, got.Name)

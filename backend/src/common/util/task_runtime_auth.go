@@ -115,6 +115,8 @@ func shadowsDirectory(mountPath, directory string) bool {
 
 // ValidateTaskRuntimePodPatch reserves credential fields for the compiler.
 // Call after dynamic user/plugin configuration has been resolved, before publishing it.
+// These wiring checks prevent accidental shadowing and preserve retry compatibility;
+// they do not isolate the token from user code sharing the launcher container.
 func ValidateTaskRuntimePodPatch(patch *corev1.PodSpec) error {
 	for _, v := range patch.Volumes {
 		if v.Name == taskTokenVolume {

@@ -59,7 +59,7 @@ func TestRecurringRunTaskCredentials(t *testing.T) {
 			require.NoError(t, err)
 			execution, err := util.NewExecutionSpecJSON(util.ArgoWorkflow, []byte(run.PipelineRuntimeManifest))
 			require.NoError(t, err)
-			require.NoError(t, execution.(*util.Workflow).ValidateTaskRuntimeCredentials(common.GetTokenReviewAudience()))
+			require.NoError(t, execution.(*util.Workflow).ValidateTaskRuntimeCredentials(common.GetTaskTokenReviewAudience()))
 			require.Equal(t, job.Namespace, run.Namespace)
 			require.Equal(t, job.ServiceAccount, run.ServiceAccount)
 			require.Equal(t, job.UUID, run.RecurringRunId)
