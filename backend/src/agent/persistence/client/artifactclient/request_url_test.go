@@ -67,7 +67,10 @@ func TestReadArtifactDoesNotFollowRedirects(t *testing.T) {
 			original := &http.Client{Transport: transport, Timeout: 3 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { originalPolicy++; return http.ErrUseLastResponse }}
 			c := NewClient("https://api.invalid", original, newTestTokenRefresher(t))
 			_, err := c.ReadArtifact(&ReadArtifactRequest{RunID: "run", NodeID: "node", ArtifactName: "metrics"})
-			require.Error(t, err)
+			require.ErrorContains(t, err, "redirect rejected")
+			var artifactErr *Error
+			require.ErrorAs(t, err, &artifactErr)
+			require.Equal(t, ErrorCodePermanent, artifactErr.Code)
 			require.Equal(t, 1, calls)
 			require.Zero(t, originalPolicy)
 			require.ErrorIs(t, original.CheckRedirect(nil, nil), http.ErrUseLastResponse)

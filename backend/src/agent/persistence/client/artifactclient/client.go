@@ -156,6 +156,11 @@ func (a *client) ReadArtifact(request *ReadArtifactRequest) (*ReadArtifactRespon
 		}
 	}()
 
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		return nil, NewError(ErrorCodePermanent, fmt.Errorf("HTTP %d", resp.StatusCode),
+			"Artifact redirect rejected; configure the API endpoint without redirects")
+	}
+
 	switch resp.StatusCode {
 	case http.StatusOK:
 		var body []byte
