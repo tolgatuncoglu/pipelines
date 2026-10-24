@@ -168,7 +168,11 @@ jobs:
             --additional-package-path "${GITHUB_WORKSPACE}/api/v2alpha1/python" \
             --additional-package-path "${GITHUB_WORKSPACE}/kubernetes_platform/python" \
             --no-push-image
-          kind --name "${{ env.CLUSTER_NAME }}" load docker-image kfp-dra-sdk:test
+          platform=$(runtime_image_platform "${{ env.CLUSTER_NAME }}")
+          dra_archive=$(mktemp)
+          trap 'rm -f "${dra_archive}"' EXIT
+          docker save "--platform=${platform}" kfp-dra-sdk:test -o "${dra_archive}"
+          kind --name "${{ env.CLUSTER_NAME }}" load image-archive "${dra_archive}"
 
       - name: Install DRA Example Driver
         uses: ./.github/actions/install-dra-driver
