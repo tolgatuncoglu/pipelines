@@ -165,8 +165,12 @@ kind() {
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(
-            all('--platform=linux/arm64' in command for command in commands
-                if command.startswith(('docker pull', 'docker save'))))
+            all(
+                '--platform=linux/arm64' in command
+                for command in commands
+                if command.startswith(('docker pull', 'docker save'))
+            )
+        )
 
     def test_kind_platform_comes_from_the_node_images(self):
         result, _ = self.run_helper('runtime_image_platform test')
