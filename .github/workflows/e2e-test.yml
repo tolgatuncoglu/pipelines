@@ -85,6 +85,7 @@ jobs:
     uses: ./.github/workflows/image-builds.yml
 
   end-to-end-scenario-tests:
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -287,6 +288,7 @@ jobs:
           ca_cert_path: ${{ env.CA_CERT_PATH }}
 
   dag-scale-test:
+    needs: build
     name: DAG Scale Test - 120 nodes
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -326,6 +328,7 @@ jobs:
           report_name: DAGScale120Nodes
 
   end-to-end-critical-scenario-multi-user-tests:
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -440,6 +443,7 @@ jobs:
 
 
   end-to-end-critical-mlflow-tests:
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       actions: read

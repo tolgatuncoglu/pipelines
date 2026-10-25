@@ -72,6 +72,7 @@ jobs:
     uses: ./.github/workflows/image-builds.yml
 
   api-test-versions:
+    needs: build
     # Full prefix coverage after merges, without adding PR-time clusters.
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
     runs-on: ubuntu-latest
@@ -120,6 +121,7 @@ jobs:
           report_name: "APIVersion_${{ matrix.api_version }}"
 
   api-test-standalone:
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -256,6 +258,7 @@ jobs:
 
 
   api-test-k8s-native:
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -315,6 +318,7 @@ jobs:
 
 
   api-test-multi-user:
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       actions: read

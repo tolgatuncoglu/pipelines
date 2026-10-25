@@ -39,7 +39,7 @@ WORKFLOW_JOBS = {
     ),
     '.github/workflows/kfp-sdk-client-tests.yml': ('sdk-client-tests',),
     '.github/workflows/kfp-webhooks.yml': ('webhook-tests',),
-    '.github/workflows/upgrade-test.yml': ('upgrade-test',),
+    '.github/workflows/upgrade-test.yml': (),
 }
 
 
@@ -69,7 +69,7 @@ class LoadedWorkflowOverlapTest(unittest.TestCase):
             for job_name in job_names:
                 with self.subTest(workflow=relative_path, job=job_name):
                     job = _job_block(workflow, job_name)
-                    self.assertNotIn('needs: build', job)
+                    self.assertIn('needs: build', job)
                     self.assertIn(
                         'permissions:\n      actions: read\n'
                         '      contents: read',

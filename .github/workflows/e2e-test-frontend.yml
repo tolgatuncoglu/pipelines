@@ -61,6 +61,7 @@ jobs:
         run: npm run test:dependencies
 
   frontend-integration-test:
+    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
